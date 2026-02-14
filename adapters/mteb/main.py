@@ -553,10 +553,10 @@ class MTEBAdapter(FrameworkAdapter):
         verbosity = benchmark_config.get("verbosity", 2)
         cmd.extend(["--verbosity", str(verbosity)])
 
-        # Device override (optional)
+        # Device override (optional, MTEB CLI expects an integer CUDA device index)
         device = benchmark_config.get("device")
-        if device:
-            cmd.extend(["--device", device])
+        if device is not None and str(device).isdigit():
+            cmd.extend(["--device", str(device)])
 
         # CO2 tracker (optional)
         if benchmark_config.get("co2_tracker", False):
