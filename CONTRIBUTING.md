@@ -5,10 +5,32 @@ This repository contains community-contributed adapters that integrate evaluatio
 ## Adding an adapter
 
 1. Create a new directory under `adapters/` named after the framework (e.g. `adapters/my-framework/`)
-2. Implement `main.py` using the `FrameworkAdapter` pattern from evalhub-sdk
-3. Add a `Containerfile` and `requirements.txt`
-4. Add build/push targets to the root `Makefile`
-5. Document the adapter in its own `README.md`
+2. Add a `provider.yaml` describing the provider — CI will reject new adapters without one (see [Provider definition](#provider-definition-provideryaml) below)
+3. Implement `main.py` using the `FrameworkAdapter` pattern from evalhub-sdk
+4. Add a `Containerfile` and `requirements.txt`
+5. Add build/push targets to the root `Makefile`
+6. Document the adapter in its own `README.md`
+
+## Provider definition (`provider.yaml`)
+
+Every adapter directory **must** contain a `provider.yaml`. CI checks for its presence and validates that it is well-formed YAML on every pull request that adds a new adapter.
+
+The file describes the provider to eval-hub: its identity, runtime resource requirements, and the benchmarks it exposes. The top-level fields are:
+
+| Field | Required | Description |
+|---|---|---|
+| `id` | ✓ | Unique identifier used in API calls (e.g. `mteb`) |
+| `name` | ✓ | Human-readable display name |
+| `description` | ✓ | Short description of what the adapter evaluates |
+| `type` | ✓ | `builtin` for community adapters |
+| `runtime.k8s.image` | ✓ | Container image for Kubernetes jobs |
+| `runtime.k8s.entrypoint` | ✓ | Command to run inside the container |
+| `runtime.k8s.cpu_request` / `memory_request` | ✓ | Kubernetes resource requests |
+| `runtime.k8s.cpu_limit` / `memory_limit` | ✓ | Kubernetes resource limits |
+| `benchmarks` | ✓ | List of benchmark definitions (id, name, description, category, metrics, tags) |
+| `parameters` | — | Optional list of configurable parameters with types and defaults |
+
+See [`adapters/mteb/provider.yaml`](adapters/mteb/provider.yaml) and [`adapters/clear/provider.yaml`](adapters/clear/provider.yaml) for complete, annotated examples.
 
 ## Building adapters
 
