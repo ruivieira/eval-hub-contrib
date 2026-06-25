@@ -8,7 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-ENV PYTHONUNBUFFERED=1 EVALHUB_MODE=k8s
+RUN chown -R 1001:0 /app && chmod -R g+w /app
+
+ENV PYTHONUNBUFFERED=1 EVALHUB_MODE=k8s DEEPEVAL_CACHE_DIR=/tmp
 
 USER 1001
 
