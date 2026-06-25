@@ -40,6 +40,7 @@ from evalhub.adapter import (
     JobStatusUpdate,
     MessageInfo,
 )
+from evalhub.adapter.auth import resolve_model_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +147,35 @@ def _build_test_cases(records: list[dict[str, Any]], benchmark_id: str) -> list[
     return test_cases
 
 
-def _create_metric(benchmark_id: str, model: str, threshold: float):
+def _resolve_judge_model(judge_name: str, judge_url: str) -> Any:
+    """Return a GPTModel pointed at an OpenAI-compatible endpoint.
+
+    Credentials are resolved via the EvalHub SDK (mounted secret file or env var)
+    so the adapter never reads the key name directly.
+    JSON mode is forced to ensure small local models return parseable output.
+    """
+    from deepeval.models.llms import GPTModel
+
+    creds = resolve_model_credentials()
+    api_key = creds.api_key
+    if not api_key:
+        auth_value = creds.auth_headers.get("Authorization", "")
+        if auth_value.startswith("Bearer "):
+            api_key = auth_value.removeprefix("Bearer ").strip()
+
+    url = judge_url.rstrip("/")
+    if not url.endswith("/v1"):
+        url = f"{url}/v1"
+
+    return GPTModel(
+        model=judge_name,
+        base_url=url,
+        api_key=api_key or "EMPTY",
+        generation_kwargs={"response_format": {"type": "json_object"}},
+    )
+
+
+def _create_metric(benchmark_id: str, model: Any, threshold: float):
     """Instantiate the DeepEval metric for the given benchmark."""
     if benchmark_id == "deepeval-correctness":
         return GEval(
@@ -210,7 +239,10 @@ class DeepEvalAdapter(FrameworkAdapter):
 
             self._validate_config(config)
             benchmark_id = config.benchmark_id
-            model_name = config.parameters["eval_model_name"]
+            model_url = config.model.url.strip().rstrip("/")
+            model_name = config.model.name
+            judge_name = config.parameters.get("eval_model_name") or model_name
+            judge_url = config.parameters.get("eval_model_url") or model_url
             threshold = float(config.parameters.get("threshold", 0.5))
             dataset_format = config.parameters.get("dataset_format", "csv")
 
@@ -244,7 +276,8 @@ class DeepEvalAdapter(FrameworkAdapter):
                 )
             )
 
-            metric = _create_metric(benchmark_id, model_name, threshold)
+            judge = _resolve_judge_model(judge_name, judge_url)
+            metric = _create_metric(benchmark_id, judge, threshold)
             eval_results = evaluate(test_cases=test_cases, metrics=[metric])
 
             # --- Phase: POST_PROCESSING ---
@@ -330,8 +363,7 @@ class DeepEvalAdapter(FrameworkAdapter):
                 f"Supported: {', '.join(BENCHMARK_METRICS)}"
             )
 
-        if "eval_model_name" not in config.parameters:
-            raise ValueError("eval_model_name is required in parameters")
+        pass
 
     def _extract_results(
         self, eval_results: Any, benchmark_id: str
@@ -429,7 +461,7 @@ class DeepEvalAdapter(FrameworkAdapter):
 
     def _compute_overall_score(
         self, results: list[EvaluationResult], benchmark_id: str
-    ) -> Optional[float]:
+    ) -> Optional[float]:  # type: ignore[override]
         """Compute overall score as the primary aggregate metric for the benchmark."""
         primary_metric = {
             "deepeval-faithfulness": "faithfulness_score",
