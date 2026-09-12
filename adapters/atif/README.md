@@ -258,6 +258,25 @@ as `judge_error`.
 
 ## Results
 
+### Judge observability
+
+When EvalHub OpenTelemetry metrics are enabled, the adapter records the
+following job-labelled metrics through the SDK telemetry provider:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `atif.judge.call.latency` | Histogram (ms) | Latency of every judge HTTP attempt. |
+| `atif.judge.call.count` | Counter | Total judge HTTP attempts, including retries. |
+| `atif.judge.call.success` | Counter | Attempts returning a non-error HTTP response. |
+| `atif.judge.call.errors` | Counter | HTTP, timeout, and transport-error attempts. |
+| `atif.judge.token.count` | Counter | Prompt and completion tokens from response `usage`. |
+
+All metrics include `evalhub.job_id` and `atif.scoring_mode`; error points also
+include a bounded `error.type` and HTTP response status where available. The
+result metadata includes the corresponding per-job counts and token totals.
+After the first trajectory completes, the adapter logs an estimated remaining
+time based on the first trajectory's elapsed scoring time.
+
 The adapter returns the following `EvaluationResult` metrics:
 
 | Metric | Meaning |

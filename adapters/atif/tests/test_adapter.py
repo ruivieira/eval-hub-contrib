@@ -9,6 +9,8 @@ import pytest
 import respx
 from evalhub.adapter import JobCallbacks, JobPhase
 from httpx import Response
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from main import (
     ATIFAdapter,
@@ -16,6 +18,7 @@ from main import (
     CustomRubricError,
     JudgeResponseError,
     ReferenceRegistryError,
+    _JudgeTelemetry,
 )
 
 
@@ -910,3 +913,73 @@ def test_timeout_is_retried(job_spec, monkeypatch):
 
     assert json.loads(response)["score"] == 0.8
     assert len(route.calls) == 2
+
+
+def test_judge_telemetry_exports_counts_latency_and_tokens(job_spec, monkeypatch):
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    monkeypatch.setattr("evalhub.adapter.telemetry.metrics.get_meter", provider.get_meter)
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    def response(content, prompt_tokens, completion_tokens):
+        return Response(
+            200,
+            json={
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                },
+                "choices": [{"message": {"content": json.dumps(content)}}],
+            },
+        )
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                response({"criteria": [{"name": "quality", "weight": 1.0}]}, 10, 2),
+                response({"score": 0.8}, 20, 3),
+                response({"score": 0.6}, 30, 4),
+            ]
+        )
+        result = adapter.run_benchmark_job(job_spec, FakeCallbacks())
+
+    metadata = result.evaluation_metadata
+    assert metadata["atif_judge_request_count"] == 3
+    assert metadata["atif_judge_prompt_token_count"] == 60
+    assert metadata["atif_judge_completion_token_count"] == 9
+    assert metadata["atif_judge_token_count"] == 69
+    assert metadata["atif_judge_success_count"] == 3
+    assert metadata["atif_judge_error_count"] == 0
+
+    exported = {}
+    for scope in reader.get_metrics_data().resource_metrics[0].scope_metrics:
+        for metric in scope.metrics:
+            points = metric.data.data_points
+            exported[metric.name] = (
+                sum(point.value for point in points)
+                if hasattr(points[0], "value")
+                else sum(point.sum for point in points)
+            )
+    assert exported["atif.judge.call.count"] == 3
+    assert exported["atif.judge.call.success"] == 3
+    assert exported["atif.judge.token.count"] == 69
+    assert "atif.judge.call.latency" in exported
+
+
+def test_judge_telemetry_records_errors_and_scoring_mode(monkeypatch):
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    monkeypatch.setattr("evalhub.adapter.telemetry.metrics.get_meter", provider.get_meter)
+    telemetry = _JudgeTelemetry("job-telemetry", "custom")
+    telemetry.record(12.5, success=False, error_type="timeout")
+
+    metrics = {
+        metric.name: metric
+        for scope in reader.get_metrics_data().resource_metrics[0].scope_metrics
+        for metric in scope.metrics
+    }
+    error_point = next(iter(metrics["atif.judge.call.errors"].data.data_points))
+    assert error_point.value == 1
+    assert error_point.attributes["evalhub.job_id"] == "job-telemetry"
+    assert error_point.attributes["atif.scoring_mode"] == "custom"
+    assert error_point.attributes["error.type"] == "timeout"

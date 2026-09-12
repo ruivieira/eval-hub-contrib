@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, get_args
 
 import httpx
+from opentelemetry import metrics as otel_metrics
 from pydantic import ValidationError
 from evalhub.adapter import (
     DefaultCallbacks,
@@ -27,6 +28,7 @@ from evalhub.adapter import (
     EnvironmentCardMetadata,
 )
 from evalhub.adapter.auth import resolve_model_credentials
+from evalhub.adapter.telemetry import EvalTracer
 from evalhub.models.atif import Trajectory
 
 logger = logging.getLogger(__name__)
@@ -45,6 +47,60 @@ MAX_CUSTOM_RUBRIC_BYTES = 16 * 1024
 MAX_CUSTOM_CRITERIA = 32
 MAX_CUSTOM_TEXT_LENGTH = 2_000
 MAX_JUDGE_ATTEMPTS = 10
+
+
+class _JudgeTelemetry:
+    """OTel metrics for one ATIF job.
+
+    The API objects are no-ops when the host has not configured a meter
+    provider, which keeps local adapter execution dependency-free at runtime.
+    """
+
+    def __init__(self, job_id: str | None, scoring_mode: str) -> None:
+        self._attributes = {
+            "evalhub.job_id": job_id or "unknown",
+            "atif.scoring_mode": scoring_mode,
+        }
+        tracer = EvalTracer()
+        if hasattr(tracer, "create_counter"):
+            create_counter = tracer.create_counter
+            create_histogram = tracer.create_histogram
+        else:  # Compatibility with the released SDK before the facade landed.
+            meter = otel_metrics.get_meter("evalhub.adapter")
+            create_counter = meter.create_counter
+            create_histogram = meter.create_histogram
+        self.call_latency = create_histogram("atif.judge.call.latency", unit="ms")
+        self.call_count = create_counter("atif.judge.call.count", unit="calls")
+        self.call_success = create_counter("atif.judge.call.success", unit="calls")
+        self.call_errors = create_counter("atif.judge.call.errors", unit="calls")
+        self.token_count = create_counter("atif.judge.token.count", unit="tokens")
+
+    def record(
+        self,
+        latency_ms: float,
+        *,
+        success: bool,
+        error_type: str | None = None,
+        status_code: int | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        attrs = dict(self._attributes)
+        if error_type:
+            attrs["error.type"] = error_type
+        if status_code is not None:
+            attrs["http.status_code"] = status_code
+        self.call_latency.record(latency_ms, attrs)
+        self.call_count.add(1, attrs)
+        (self.call_success if success else self.call_errors).add(1, attrs)
+        if prompt_tokens:
+            self.token_count.add(prompt_tokens, {**self._attributes, "token.type": "input"})
+        if completion_tokens:
+            self.token_count.add(
+                completion_tokens, {**self._attributes, "token.type": "output"}
+            )
+
+
 FAILURE_CATEGORIES = frozenset(
     {
         "tool_selection_failure",
@@ -368,6 +424,12 @@ class ATIFAdapter(FrameworkAdapter):
                 ),
                 "atif_judge_request_count": self._judge_request_count,
                 "atif_judge_request_limit": max_judge_requests,
+                "atif_judge_prompt_token_count": self._judge_prompt_token_count,
+                "atif_judge_completion_token_count": self._judge_completion_token_count,
+                "atif_judge_token_count": self._judge_prompt_token_count
+                + self._judge_completion_token_count,
+                "atif_judge_success_count": self._judge_success_count,
+                "atif_judge_error_count": self._judge_error_count,
             },
             env_card=self._build_environment_card(trajectories),
         )
@@ -779,6 +841,13 @@ class ATIFAdapter(FrameworkAdapter):
         self._judge_initial_backoff_seconds = judge_initial_backoff_seconds
         self._judge_request_limit = max_judge_requests
         self._judge_request_count = 0
+        self._judge_prompt_token_count = 0
+        self._judge_completion_token_count = 0
+        self._judge_success_count = 0
+        self._judge_error_count = 0
+        self._judge_telemetry = _JudgeTelemetry(
+            getattr(self.job_spec, "id", None), scoring_mode
+        )
         self._judge_request_lock = asyncio.Lock()
         criteria = (
             await self._derive_criteria(trajectories[0])
@@ -1191,6 +1260,9 @@ class ATIFAdapter(FrameworkAdapter):
                         json=request_body,
                     )
             except httpx.TimeoutException as exc:
+                self._record_judge_attempt(
+                    start, success=False, error_type="timeout"
+                )
                 if attempt < retries - 1:
                     logger.warning("ATIF judge request timed out; retrying")
                     await asyncio.sleep(delay)
@@ -1198,6 +1270,9 @@ class ATIFAdapter(FrameworkAdapter):
                     continue
                 raise RuntimeError("Judge call timed out after retries") from exc
             except httpx.HTTPError as exc:
+                self._record_judge_attempt(
+                    start, success=False, error_type="transport_error"
+                )
                 if attempt < retries - 1:
                     logger.warning("ATIF judge request failed; retrying: %s", exc)
                     await asyncio.sleep(delay)
@@ -1205,9 +1280,24 @@ class ATIFAdapter(FrameworkAdapter):
                     continue
                 raise RuntimeError("Judge call failed after retries") from exc
             latency_ms = (time.monotonic() - start) * 1000
-            logger.info("atif.judge.call.latency=%s", latency_ms)
-            logger.info("atif.judge.call.count=1")
-            logger.info("atif.judge.token.count=%s", len(response.text))
+            response_payload: dict[str, Any] = {}
+            try:
+                decoded = response.json()
+                if isinstance(decoded, dict):
+                    response_payload = decoded
+            except ValueError:
+                pass
+            usage = response_payload.get("usage") or {}
+            prompt_tokens = self._nonnegative_int(usage.get("prompt_tokens"))
+            completion_tokens = self._nonnegative_int(usage.get("completion_tokens"))
+            self._record_judge_attempt(
+                start,
+                success=not response.is_error,
+                error_type=("http_error" if response.is_error else None),
+                status_code=response.status_code,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
             if response.status_code == 429 or 500 <= response.status_code <= 599:
                 if attempt < retries - 1:
                     logger.warning(
@@ -1225,12 +1315,51 @@ class ATIFAdapter(FrameworkAdapter):
                 )
             response.raise_for_status()
             try:
-                result = response.json()
+                result = response_payload or response.json()
                 content = result["choices"][0]["message"]["content"]
             except (ValueError, KeyError, IndexError, TypeError):
                 return response.text
             return content if isinstance(content, str) else json.dumps(content)
         raise RuntimeError("Judge call failed after retries")
+
+    @staticmethod
+    def _nonnegative_int(value: Any) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed >= 0 else 0
+
+    def _record_judge_attempt(
+        self,
+        start: float,
+        *,
+        success: bool,
+        error_type: str | None = None,
+        status_code: int | None = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        self._judge_prompt_token_count = getattr(
+            self, "_judge_prompt_token_count", 0
+        ) + prompt_tokens
+        self._judge_completion_token_count = getattr(
+            self, "_judge_completion_token_count", 0
+        ) + completion_tokens
+        if success:
+            self._judge_success_count = getattr(self, "_judge_success_count", 0) + 1
+        else:
+            self._judge_error_count = getattr(self, "_judge_error_count", 0) + 1
+        telemetry = getattr(self, "_judge_telemetry", None)
+        if telemetry is not None:
+            telemetry.record(
+                (time.monotonic() - start) * 1000,
+                success=success,
+                error_type=error_type,
+                status_code=status_code,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+            )
 
 
 def main() -> None:
