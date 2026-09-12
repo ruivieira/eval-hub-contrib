@@ -86,6 +86,7 @@ Parameters are supplied through the EvalHub job's generic `parameters` object.
 | `max_total_steps` | integer | `10000` | Maximum number of steps in one complete trajectory tree. |
 | `subagent_aggregation` | string | `flat` | `flat` averages every scored trajectory, `hierarchical` averages each parent with its descendants, and `separate` reports only root scores in the overall aggregate while retaining nested results. |
 | `failure_threshold` | float | `0.5` | Scores strictly below this value are treated as detectable failures and sent for categorization. Must be in `[0, 1]`. |
+| `completion_threshold` | float | `0.5` | Scores at or above this value mark a trajectory as passed. Must be in `[0, 1]`. |
 | `training_threshold` | float | unset | Optional score threshold for training eligibility. A trajectory is eligible when its aggregate score is greater than or equal to this value. Must be in `[0, 1]`. |
 
 The adapter rejects an explicitly supplied invalid threshold before loading
@@ -102,6 +103,7 @@ each trajectory and the training manifest is empty.
   "max_trajectory_files": 1000,
   "max_steps_per_trajectory": 500,
   "failure_threshold": 0.5,
+  "completion_threshold": 0.5,
   "training_threshold": 0.8
 }
 ```
@@ -282,12 +284,19 @@ atif_training_manifest
 ```
 
 Each entry in `atif_trajectories` contains the trajectory ID, local source
-path, aggregate score, step count, per-step results, detectable-failure count,
+path, aggregate score, completion threshold, `passed` status, step count, per-step results, detectable-failure count,
 categorized-failure count, uncategorized-failure count,
 categorization-judge-error count, and `training_eligible`. Each step result
-contains its step ID and score. Detectable failures additionally contain
+contains its trajectory ID, zero-based step index, step ID, and score. When a
+step contains tool calls, it also contains `tool_name` (the first callable) and
+`tool_names` (all distinct callables). Detectable failures additionally contain
 `category`, `confidence`, `rationale`, and `categorization_status`; malformed
 responses also contain `raw_judge_response`.
+
+The detailed result is JSON serializable through the SDK `JobResults` model
+(`model_dump(mode="json")`). A trajectory passes when its aggregate score is
+greater than or equal to `completion_threshold`; this status is independent of
+failure categorization and training eligibility.
 
 When `training_threshold` is set, `atif_training_manifest` contains the local
 source paths of trajectories whose aggregate score meets the threshold. These

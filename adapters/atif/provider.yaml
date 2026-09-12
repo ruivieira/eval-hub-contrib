@@ -73,3 +73,7 @@ parameters:
   - name: training_threshold
     type: float
     description: Optional score threshold for marking trajectories training-eligible
+  - name: completion_threshold
+    type: float
+    default: 0.5
+    description: Score threshold at or above which a trajectory is marked passed

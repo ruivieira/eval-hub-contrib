@@ -38,6 +38,7 @@ MAX_STEPS_PER_TRAJECTORY = 500
 MAX_SUBAGENT_DEPTH = 8
 MAX_TOTAL_STEPS = 10_000
 DEFAULT_FAILURE_THRESHOLD = 0.5
+DEFAULT_COMPLETION_THRESHOLD = 0.5
 DEFAULT_SCORING_MODE = "auto"
 DEFAULT_REFERENCE_RUBRIC = "default"
 MAX_CUSTOM_RUBRIC_BYTES = 16 * 1024
@@ -111,6 +112,11 @@ class ATIFAdapter(FrameworkAdapter):
         )
         if not 0.0 <= failure_threshold <= 1.0:
             raise ValueError("failure_threshold must be between 0 and 1")
+        completion_threshold = float(
+            params.get("completion_threshold", DEFAULT_COMPLETION_THRESHOLD)
+        )
+        if not 0.0 <= completion_threshold <= 1.0:
+            raise ValueError("completion_threshold must be between 0 and 1")
         training_threshold_value = params.get("training_threshold")
         training_threshold = (
             float(training_threshold_value)
@@ -189,6 +195,8 @@ class ATIFAdapter(FrameworkAdapter):
                 else item["aggregate_score"] >= training_threshold
             )
             item["training_eligible"] = eligible
+            item["completion_threshold"] = completion_threshold
+            item["passed"] = item["aggregate_score"] >= completion_threshold
             if eligible:
                 source_path = item.get("source_path")
                 if source_path is not None:
@@ -197,13 +205,16 @@ class ATIFAdapter(FrameworkAdapter):
         # Diagnostics always cover the complete scored tree, even when the
         # selected aggregate intentionally reports only top-level trajectories.
         scored_for_metrics = self._flatten_scored_trajectories(scored)
-        avg_score = (
-            sum(item["aggregate_score"] for item in scored) / len(scored)
-            if subagent_aggregation == "hierarchical" and scored
-            else sum(item["score"] for item in scored_for_metrics) / len(scored_for_metrics)
-            if scored_for_metrics
-            else 0.0
-        )
+        if subagent_aggregation == "hierarchical" and scored:
+            avg_score = sum(item["aggregate_score"] for item in scored) / len(scored)
+        elif subagent_aggregation == "separate" and scored:
+            avg_score = sum(item["score"] for item in scored) / len(scored)
+        elif scored_for_metrics:
+            avg_score = sum(item["score"] for item in scored_for_metrics) / len(
+                scored_for_metrics
+            )
+        else:
+            avg_score = 0.0
         detectable_failures = sum(
             item["detectable_failure_count"] for item in scored_for_metrics
         )
@@ -285,6 +296,7 @@ class ATIFAdapter(FrameworkAdapter):
                     custom_rubric.get("aggregation") if custom_rubric else None
                 ),
                 "atif_failure_threshold": failure_threshold,
+                "atif_completion_threshold": completion_threshold,
                 "atif_detectable_failure_count": detectable_failures,
                 "atif_categorized_failure_count": categorized_failures,
                 "atif_uncategorized_failure_count": uncategorized_failures,
@@ -809,7 +821,8 @@ class ATIFAdapter(FrameworkAdapter):
         categorized_failure_count = 0
         uncategorized_failure_count = 0
         categorization_judge_error_count = 0
-        for step in trajectory.get("steps", []):
+        trajectory_id = trajectory.get("trajectory_id")
+        for step_index, step in enumerate(trajectory.get("steps", [])):
             payload = {
                 "criteria": criteria,
                 "step": step,
@@ -846,9 +859,15 @@ class ATIFAdapter(FrameworkAdapter):
             step_scores.append(score)
 
             step_result: dict[str, Any] = {
+                "trajectory_id": trajectory_id,
+                "step_index": step_index,
                 "step_id": step.get("step_id"),
                 "score": score,
             }
+            tool_names = self._tool_names(step)
+            if tool_names:
+                step_result["tool_name"] = tool_names[0]
+                step_result["tool_names"] = tool_names
             if criterion_scores is not None:
                 step_result["criterion_scores"] = criterion_scores
             if score < failure_threshold:
@@ -873,6 +892,23 @@ class ATIFAdapter(FrameworkAdapter):
             "uncategorized_failure_count": uncategorized_failure_count,
             "categorization_judge_error_count": categorization_judge_error_count,
         }
+
+    @staticmethod
+    def _tool_names(step: dict[str, Any]) -> list[str]:
+        """Return the callable names recorded by an ATIF step."""
+        names: list[str] = []
+        for tool_call in step.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            name = (
+                tool_call.get("function_name")
+                or tool_call.get("name")
+                or (function.get("name") if isinstance(function, dict) else None)
+            )
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+        return names
 
     @classmethod
     def _parse_custom_score_response(
