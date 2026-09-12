@@ -83,7 +83,8 @@ Parameters are supplied through the EvalHub job's generic `parameters` object.
 | Parameter | Type | Default | Description |
 | --- | --- | ---: | --- |
 | `trajectory_path` | string | `/test_data/trajectory.json` | Single ATIF JSON file or directory containing ATIF JSON files. |
-| `scoring_mode` | string | `auto` | `auto` derives criteria from the judge; `reference` (or `benchmark`) uses a local reference registry; `custom` uses `custom_rubric` or `custom_rubric_path`. |
+| `scoring_mode` | string | `auto` | `auto` derives criteria; `benchmark` uses a built-in benchmark rubric; `reference` uses a local registry; `custom` uses `custom_rubric` or `custom_rubric_path`. |
+| `benchmark_name` | string | unset | Built-in benchmark name required by `benchmark` mode. |
 | `reference_registry_path` | string | unset | JSON registry path required for `reference` mode. |
 | `reference_rubric` | string | `default` | Named rubric selected from the registry. |
 | `custom_rubric` | object/string | unset | Inline rubric object or JSON string required for `custom` mode. Mutually exclusive with `custom_rubric_path`. |
@@ -162,8 +163,24 @@ instructions.
 
 ### Benchmark/reference scoring
 
-Set `scoring_mode` to `reference` and provide `reference_registry_path` and a
-`reference_rubric`. The registry is adapter-local, so it can be mounted with
+Set `scoring_mode` to `benchmark` and provide a registered `benchmark_name` to
+use the built-in benchmark rubric:
+
+```json
+{
+  "scoring_mode": "benchmark",
+  "benchmark_name": "swe-bench-lite"
+}
+```
+
+The initial built-in registry contains `swe-bench-lite`, `terminal-bench`, and
+`humaneval`. It supplies stable scoring criteria for an existing ATIF
+trajectory; it does not download data, execute the benchmark, or rerun the
+agent. The registry version and selected benchmark are included in result
+metadata.
+
+For user-managed rubrics, set `scoring_mode` to `reference` and provide
+`reference_registry_path` and a `reference_rubric`. The registry is adapter-local, so it can be mounted with
 benchmark data or baked into the adapter image without a server change. Its
 minimum shape is:
 
@@ -384,8 +401,10 @@ PYTHONPATH=. pytest -q tests
 The test suite covers ATIF parsing and limits, supported schema versions,
 duplicate IDs, malformed input, score validation, genuine zero scores,
 failure categorization, 429 retries, training eligibility, and invalid
-training thresholds. Reference-mode tests cover rubric selection, reference
-injection into judge prompts, and missing-fixture failures.
+training thresholds. Benchmark-mode tests cover built-in rubric lookup,
+dispatch, unknown names, missing names, validation, and reproducibility;
+reference-mode tests cover rubric selection, reference injection into judge
+prompts, and missing-fixture failures.
 Proxy contract tests additionally cover Kubernetes credential indirection,
 configured model routing, and local HTTPS endpoints with optional CA bundles.
 
@@ -393,8 +412,8 @@ configured model routing, and local HTTPS endpoints with optional CA bundles.
 
 - Input is local or mounted filesystem data; S3 discovery and download are
   owned by a downstream EvalHub input contract.
-- The reference flow currently uses file-backed registries; server-managed
-  benchmark catalogs are not implemented.
+- Benchmark rubrics are currently adapter-local and built in; server-managed
+  benchmark catalogs and Harbor verifier execution are not implemented.
 - Nested `subagent_trajectories` are scored recursively with configurable depth,
   total-step, duplicate-ID, and aggregation controls.
 - Partial results are supported through `partial_result_policy`, but resume and

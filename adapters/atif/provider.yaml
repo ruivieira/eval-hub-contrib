@@ -36,7 +36,10 @@ parameters:
   - name: scoring_mode
     type: string
     default: auto
-    description: Scoring mode; auto uses judge-derived criteria, reference uses a local registry, and custom uses an inline or mounted rubric.
+    description: Scoring mode; auto derives criteria, benchmark selects a built-in benchmark rubric, reference uses a local registry, and custom uses an inline or mounted rubric.
+  - name: benchmark_name
+    type: string
+    description: Built-in benchmark rubric selected when scoring_mode is benchmark (swe-bench-lite, terminal-bench, or humaneval).
   - name: reference_registry_path
     type: string
     description: Path to a JSON rubric registry required when scoring_mode is reference.

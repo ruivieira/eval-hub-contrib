@@ -20,6 +20,7 @@ from main import (
     ReferenceRegistryError,
     _JudgeTelemetry,
 )
+from rubric_registry import RubricRegistry
 
 
 JOB_SPEC_PATH = Path(__file__).resolve().parent.parent / "meta" / "job.json"
@@ -190,6 +191,126 @@ def test_reference_scoring_uses_registry_rubric_and_fixture(job_spec):
     first_payload = json.loads(requests[0].request.content)["messages"][0]["content"]
     assert json.loads(first_payload)["reference"]["answer"].startswith("The agent")
     assert json.loads(first_payload)["criteria"]["rubric"] == "answer_quality"
+
+
+@pytest.mark.parametrize("benchmark_name", RubricRegistry.names())
+def test_benchmark_scoring_dispatches_registered_rubric(job_spec, benchmark_name):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+    job_spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "scoring_mode": "benchmark",
+                "benchmark_name": benchmark_name,
+            }
+        }
+    )
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post("http://localhost:8080/v1/chat/completions")
+        route.mock(
+            side_effect=[
+                Response(200, text=json.dumps({"score": 0.8})),
+                Response(200, text=json.dumps({"score": 0.6})),
+            ]
+        )
+        result = adapter.run_benchmark_job(job_spec, callbacks)
+
+    assert result.overall_score == 0.7
+    metadata = result.evaluation_metadata
+    assert metadata["atif_scoring_mode"] == "benchmark"
+    assert metadata["atif_benchmark_name"] == benchmark_name
+    assert metadata["atif_benchmark_registry_version"] == RubricRegistry.VERSION
+    payloads = [json.loads(call.request.content)["messages"][0]["content"] for call in route.calls]
+    assert all(json.loads(payload)["criteria"]["rubric"] == benchmark_name for payload in payloads)
+    assert all("criteria" in json.loads(payload)["criteria"] for payload in payloads)
+
+
+def test_benchmark_scoring_requires_name(job_spec):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    job_spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "scoring_mode": "benchmark",
+            }
+        }
+    )
+
+    with pytest.raises(ReferenceRegistryError, match="benchmark_name is required"):
+        adapter.run_benchmark_job(job_spec, FakeCallbacks())
+
+
+def test_benchmark_scoring_rejects_unknown_name(job_spec):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    job_spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "scoring_mode": "benchmark",
+                "benchmark_name": "not-a-real-benchmark",
+            }
+        }
+    )
+
+    with pytest.raises(ReferenceRegistryError, match="unknown benchmark") as error:
+        adapter.run_benchmark_job(job_spec, FakeCallbacks())
+    assert "swe-bench-lite" in str(error.value)
+
+
+def test_benchmark_registry_returns_stable_independent_rubrics():
+    first = RubricRegistry.get("SWE-BENCH-LITE")
+    second = RubricRegistry.get("swe-bench-lite")
+    assert first == second
+    first["criteria"][0]["name"] = "changed"
+    assert RubricRegistry.get("swe-bench-lite")["criteria"][0]["name"] != "changed"
+
+
+def test_benchmark_registry_validates_seed_rubrics():
+    for name in RubricRegistry.names():
+        rubric = RubricRegistry.get(name)
+        assert rubric["criteria"]
+        assert len({criterion["name"] for criterion in rubric["criteria"]}) == len(
+            rubric["criteria"]
+        )
+        assert all(criterion["weight"] > 0 for criterion in rubric["criteria"])
+
+
+def test_benchmark_scoring_is_reproducible_for_equivalent_input(job_spec):
+    job_spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "scoring_mode": "benchmark",
+                "benchmark_name": "swe-bench-lite",
+            }
+        }
+    )
+    payloads: list[list[str]] = []
+    results = []
+    for _ in range(2):
+        adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+        with respx.mock(assert_all_called=False) as mock:
+            route = mock.post("http://localhost:8080/v1/chat/completions")
+            route.mock(
+                side_effect=[
+                    Response(200, text=json.dumps({"score": 0.8})),
+                    Response(200, text=json.dumps({"score": 0.6})),
+                ]
+            )
+            result = adapter.run_benchmark_job(job_spec, FakeCallbacks())
+            payloads.append(
+                [
+                    call.request.content.decode()
+                    for call in route.calls
+                ]
+            )
+            results.append(result)
+
+    assert results[0].overall_score == results[1].overall_score
+    assert results[0].evaluation_metadata == results[1].evaluation_metadata
+    assert payloads[0] == payloads[1]
 
 
 def test_reference_scoring_rejects_missing_fixture(job_spec, tmp_path: Path):

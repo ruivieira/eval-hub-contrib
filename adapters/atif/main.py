@@ -30,6 +30,8 @@ from evalhub.adapter import (
 from evalhub.adapter.auth import resolve_model_credentials
 from evalhub.adapter.telemetry import EvalTracer
 from evalhub.models.atif import Trajectory
+from rubric_registry import RubricRegistry
+from rubric_registry import UnknownBenchmarkError
 
 logger = logging.getLogger(__name__)
 
@@ -149,10 +151,10 @@ class ATIFAdapter(FrameworkAdapter):
 
         params = config.parameters or {}
         scoring_mode = str(params.get("scoring_mode", DEFAULT_SCORING_MODE)).lower()
-        if scoring_mode == "benchmark":
-            scoring_mode = "reference"
-        if scoring_mode not in {"auto", "reference", "custom"}:
-            raise ValueError("scoring_mode must be 'auto', 'reference', or 'custom'")
+        if scoring_mode not in {"auto", "benchmark", "reference", "custom"}:
+            raise ValueError(
+                "scoring_mode must be 'auto', 'benchmark', 'reference', or 'custom'"
+            )
         concurrency_limit = int(params.get("concurrency_limit", 10))
         trajectory_path = params.get("trajectory_path", "/test_data/trajectory.json")
         max_file_bytes = int(params.get("max_file_bytes", MAX_ATIF_FILE_BYTES))
@@ -225,6 +227,8 @@ class ATIFAdapter(FrameworkAdapter):
         reference_criteria: dict[str, Any] | None = None
         reference_fixtures: dict[str, Any] | None = None
         reference_rubric: str | None = None
+        benchmark_name: str | None = None
+        benchmark_registry_version: int | None = None
         custom_rubric: dict[str, Any] | None = None
         if scoring_mode == "reference":
             reference_rubric = str(
@@ -238,6 +242,24 @@ class ATIFAdapter(FrameworkAdapter):
             reference_criteria, reference_fixtures = self._load_reference_registry(
                 str(registry_path), reference_rubric
             )
+        elif scoring_mode == "benchmark":
+            configured_benchmark = params.get("benchmark_name")
+            if not isinstance(configured_benchmark, str) or not configured_benchmark.strip():
+                raise ReferenceRegistryError(
+                    "benchmark_name is required when scoring_mode is 'benchmark'"
+                )
+            benchmark_name = configured_benchmark.strip().lower()
+            try:
+                benchmark_rubric = RubricRegistry.get(benchmark_name)
+            except UnknownBenchmarkError as exc:
+                raise ReferenceRegistryError(str(exc)) from exc
+            reference_rubric = benchmark_name
+            benchmark_registry_version = benchmark_rubric["registry_version"]
+            reference_criteria = {
+                "criteria": benchmark_rubric["criteria"],
+                "rubric": benchmark_name,
+                "registry_version": benchmark_registry_version,
+            }
         elif scoring_mode == "custom":
             custom_rubric = self._load_custom_rubric(params)
 
@@ -403,6 +425,8 @@ class ATIFAdapter(FrameworkAdapter):
                 "atif_subagent_depth_limit": max_subagent_depth,
                 "atif_total_step_limit": max_total_steps,
                 "atif_reference_rubric": reference_rubric,
+                "atif_benchmark_name": benchmark_name,
+                "atif_benchmark_registry_version": benchmark_registry_version,
                 "atif_custom_rubric": (
                     custom_rubric.get("name") if custom_rubric else None
                 ),
