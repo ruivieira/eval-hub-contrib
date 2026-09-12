@@ -1,0 +1,38 @@
+id: atif
+name: ATIF Trajectory Adapter
+description: Evaluate pre-recorded ATIF trajectories using an OpenAI-compatible judge.
+type: builtin
+
+runtime:
+  k8s:
+    image: quay.io/evalhub/community-atif:latest
+    entrypoint:
+      - python
+      - main.py
+    cpu_request: 100m
+    memory_request: 256Mi
+    cpu_limit: 1000m
+    memory_limit: 2Gi
+  local:
+
+benchmarks:
+  - id: atif_trajectory_default
+    name: ATIF Trajectory Evaluation
+    description: Judge-based ATIF trajectory evaluation
+    category: agentic
+    metrics:
+      - atif_overall_score
+    tags:
+      - atif
+      - trajectory
+    primary_score:
+      metric: atif_overall_score
+      lower_is_better: false
+    pass_criteria:
+      threshold: 0.5
+
+parameters:
+  - name: concurrency_limit
+    type: integer
+    default: 10
+    description: Max number of trajectories scored concurrently
