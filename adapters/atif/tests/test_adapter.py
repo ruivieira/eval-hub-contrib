@@ -8,7 +8,7 @@ import respx
 from evalhub.adapter import JobCallbacks
 from httpx import Response
 
-from main import ATIFAdapter, ATIFLoadError
+from main import ATIFAdapter, ATIFLoadError, JudgeResponseError
 
 
 JOB_SPEC_PATH = Path(__file__).resolve().parent.parent / "meta" / "job.json"
@@ -41,8 +41,57 @@ def test_atif_adapter_happy_path(job_spec):
         result = adapter.run_benchmark_job(job_spec, callbacks)
 
     assert result.overall_score == 0.7
-    assert len(result.results) == 2
+    assert len(result.results) == 3
     assert "atif_trajectories" in result.evaluation_metadata
+
+
+def test_training_eligibility_marks_trajectories_and_manifest(job_spec):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+    job_spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "training_threshold": 0.65,
+            }
+        }
+    )
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=json.dumps({"score": 0.8})),
+                Response(200, text=json.dumps({"score": 0.6})),
+            ]
+        )
+
+        result = adapter.run_benchmark_job(job_spec, callbacks)
+
+    trajectory = result.evaluation_metadata["atif_trajectories"][0]
+    assert trajectory["training_eligible"] is True
+    assert trajectory["source_path"].endswith("trajectory.json")
+    assert result.evaluation_metadata["atif_training_threshold"] == 0.65
+    assert result.evaluation_metadata["atif_training_manifest"] == [
+        trajectory["source_path"]
+    ]
+
+
+@pytest.mark.parametrize("training_threshold", [-0.1, 1.1])
+def test_invalid_training_threshold_fails_fast(job_spec, training_threshold):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+    job_spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "training_threshold": training_threshold,
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="training_threshold"):
+        adapter.run_benchmark_job(job_spec, callbacks)
 
 
 def test_failure_categorization_for_low_scoring_step(job_spec):
@@ -99,6 +148,52 @@ def test_invalid_failure_category_is_uncategorized_with_raw_response(job_spec):
     assert result.evaluation_metadata["atif_failure_categorization_rate"] == 0.0
 
 
+@pytest.mark.parametrize(
+    "score_response",
+    [
+        "not valid JSON",
+        json.dumps({}),
+        json.dumps({"score": "not-a-number"}),
+        json.dumps({"score": 1.1}),
+    ],
+)
+def test_invalid_score_response_fails_closed(job_spec, score_response):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=score_response),
+            ]
+        )
+
+        with pytest.raises(JudgeResponseError, match="judge"):
+            adapter.run_benchmark_job(job_spec, callbacks)
+
+
+def test_zero_score_is_preserved_as_a_valid_score(job_spec):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=json.dumps({"score": 0.0})),
+                Response(200, text=json.dumps({"category": "none", "confidence": 1.0})),
+                Response(200, text=json.dumps({"score": 0.0})),
+                Response(200, text=json.dumps({"category": "none", "confidence": 1.0})),
+            ]
+        )
+
+        result = adapter.run_benchmark_job(job_spec, callbacks)
+
+    assert result.overall_score == 0.0
+    assert result.evaluation_metadata["atif_detectable_failure_count"] == 2
+
+
 def test_discover_directory(tmp_path: Path):
     f1 = tmp_path / "a.json"
     f2 = tmp_path / "nested" / "b.json"
@@ -130,6 +225,12 @@ def test_load_valid_trajectory_uses_sdk_model(tmp_path: Path):
     assert len(loaded) == 1
     assert loaded[0]["schema_version"] == "ATIF-v1.8"
     assert loaded[0]["trajectory_id"] == "t1"
+
+
+def test_supported_schema_versions_come_from_sdk_model():
+    assert ATIFAdapter._supported_schema_versions() == frozenset(
+        f"ATIF-v1.{version}" for version in range(9)
+    )
 
 
 def test_load_rejects_malformed_json(tmp_path: Path):

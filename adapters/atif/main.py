@@ -4,11 +4,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import httpx
 from pydantic import ValidationError
@@ -49,6 +50,10 @@ class ATIFLoadError(ValueError):
     """Raised when an ATIF input collection cannot be loaded safely."""
 
 
+class JudgeResponseError(ValueError):
+    """Raised when the judge does not return a valid score response."""
+
+
 class ATIFAdapter(FrameworkAdapter):
     def run_benchmark_job(self, config: JobSpec, callbacks: JobCallbacks) -> JobResults:
         start_time = time.monotonic()
@@ -75,6 +80,14 @@ class ATIFAdapter(FrameworkAdapter):
         )
         if not 0.0 <= failure_threshold <= 1.0:
             raise ValueError("failure_threshold must be between 0 and 1")
+        training_threshold_value = params.get("training_threshold")
+        training_threshold = (
+            float(training_threshold_value)
+            if training_threshold_value is not None
+            else None
+        )
+        if training_threshold is not None and not 0.0 <= training_threshold <= 1.0:
+            raise ValueError("training_threshold must be between 0 and 1")
 
         callbacks.report_status(
             JobStatusUpdate(
@@ -109,6 +122,18 @@ class ATIFAdapter(FrameworkAdapter):
                 trajectories, concurrency_limit, failure_threshold=failure_threshold
             )
         )
+        eligible_paths: list[str] = []
+        for item in scored:
+            eligible = (
+                None
+                if training_threshold is None
+                else item["score"] >= training_threshold
+            )
+            item["training_eligible"] = eligible
+            if eligible:
+                source_path = item.get("source_path")
+                if source_path is not None:
+                    eligible_paths.append(source_path)
 
         avg_score = sum(item["score"] for item in scored) / len(scored) if scored else 0.0
         detectable_failures = sum(item["detectable_failure_count"] for item in scored)
@@ -173,6 +198,8 @@ class ATIFAdapter(FrameworkAdapter):
                 "atif_detectable_failure_trajectory_count": detectable_failure_trajectories,
                 "atif_categorized_failure_trajectory_count": categorized_failure_trajectories,
                 "atif_failure_categorization_rate": categorization_rate,
+                "atif_training_threshold": training_threshold,
+                "atif_training_manifest": eligible_paths,
             },
         )
 
@@ -194,10 +221,12 @@ class ATIFAdapter(FrameworkAdapter):
 
     @staticmethod
     def _supported_schema_versions() -> frozenset[str]:
-        """Read supported versions from the SDK model instead of duplicating them."""
-        schema = Trajectory.model_json_schema()
-        versions = schema["properties"]["schema_version"].get("enum", [])
-        return frozenset(str(version) for version in versions)
+        """Read supported versions from the SDK model without schema resolution."""
+        # Trajectory is recursive, so Pydantic may represent its JSON schema as
+        # a top-level ``$ref``. Inspecting the field annotation avoids relying
+        # on the schema layout while keeping the SDK as the source of truth.
+        annotation = Trajectory.model_fields["schema_version"].annotation
+        return frozenset(str(version) for version in get_args(annotation))
 
     @classmethod
     def _validate_trajectory_limits(
@@ -277,7 +306,9 @@ class ATIFAdapter(FrameworkAdapter):
                         f"{file}; already defined in {previous}"
                     )
                 trajectory_sources[parsed.trajectory_id] = file
-            trajectories.append(parsed.model_dump(mode="json"))
+            trajectory = parsed.model_dump(mode="json")
+            trajectory["_source_path"] = str(file)
+            trajectories.append(trajectory)
         return trajectories
 
     async def _score_trajectories(
@@ -306,6 +337,7 @@ class ATIFAdapter(FrameworkAdapter):
                     logger.info("Estimated remaining time: %.2fs", remaining)
                 return {
                     "trajectory_id": trajectory.get("trajectory_id", f"trajectory-{index}"),
+                    "source_path": trajectory.get("_source_path"),
                     **details,
                     "step_count": len(trajectory.get("steps", [])),
                 }
@@ -348,11 +380,11 @@ class ATIFAdapter(FrameworkAdapter):
                 "request": "Return JSON with numeric 'score' between 0 and 1",
             }
             response = await self._judge_call(payload)
-            try:
-                parsed = json.loads(response)
-                score = float(parsed.get("score", 0.0))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                score = 0.0
+            score = self._parse_score_response(
+                response,
+                trajectory_id=trajectory.get("trajectory_id"),
+                step_id=step.get("step_id"),
+            )
             step_scores.append(score)
 
             step_result: dict[str, Any] = {
@@ -375,6 +407,49 @@ class ATIFAdapter(FrameworkAdapter):
             "detectable_failure_count": detectable_failure_count,
             "categorized_failure_count": categorized_failure_count,
         }
+
+    @staticmethod
+    def _parse_score_response(
+        response: str,
+        *,
+        trajectory_id: Any,
+        step_id: Any,
+    ) -> float:
+        """Parse and validate one judge score without masking protocol errors."""
+        try:
+            parsed = json.loads(response)
+        except json.JSONDecodeError as exc:
+            raise JudgeResponseError(
+                "judge returned non-JSON score response "
+                f"for trajectory={trajectory_id!r}, step={step_id!r}"
+            ) from exc
+
+        if not isinstance(parsed, dict) or "score" not in parsed:
+            raise JudgeResponseError(
+                "judge score response is missing numeric 'score' "
+                f"for trajectory={trajectory_id!r}, step={step_id!r}"
+            )
+
+        raw_score = parsed["score"]
+        if isinstance(raw_score, bool):
+            raise JudgeResponseError(
+                "judge score must be numeric, not boolean "
+                f"for trajectory={trajectory_id!r}, step={step_id!r}"
+            )
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError) as exc:
+            raise JudgeResponseError(
+                "judge score is not numeric "
+                f"for trajectory={trajectory_id!r}, step={step_id!r}"
+            ) from exc
+
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise JudgeResponseError(
+                "judge score must be finite and between 0 and 1 "
+                f"for trajectory={trajectory_id!r}, step={step_id!r}"
+            )
+        return score
 
     async def _categorize_failure(
         self, step: dict[str, Any], score: float, criteria: dict[str, Any]

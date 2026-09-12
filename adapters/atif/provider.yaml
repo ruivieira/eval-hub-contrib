@@ -53,3 +53,6 @@ parameters:
     type: float
     default: 0.5
     description: Scores below this threshold trigger failure categorization
+  - name: training_threshold
+    type: float
+    description: Optional score threshold for marking trajectories training-eligible
