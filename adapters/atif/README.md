@@ -239,6 +239,17 @@ counts as fully categorized only when all of its detectable failures receive a
 valid category response, including `none` when the judge finds no actionable
 failure.
 
+The fixed acceptance corpus is in `tests/fixtures/failure_corpus/`. The
+repeatable offline acceptance test
+`tests/test_failure_categorization_acceptance.py` runs it through the adapter
+with two deterministic judge profiles representing an open model
+(`llama-3.1-8b-instruct`) and a proprietary model (`gpt-4.1`). Both profiles
+must achieve at least 90% categorization coverage and category accuracy. Run:
+
+```sh
+PYTHONPATH=. pytest -q tests/test_failure_categorization_acceptance.py
+```
+
 ### Nested subagent scoring
 
 Embedded `subagent_trajectories` are scored recursively and retained under
