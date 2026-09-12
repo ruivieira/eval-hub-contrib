@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 MAX_ATIF_FILE_BYTES = 10 * 1024 * 1024
 MAX_ATIF_FILES = 10_000
 MAX_STEPS_PER_TRAJECTORY = 500
-MAX_SUBAGENT_DEPTH = 8
+MAX_SUBAGENT_DEPTH = 3
 MAX_TOTAL_STEPS = 10_000
 DEFAULT_FAILURE_THRESHOLD = 0.5
 DEFAULT_COMPLETION_THRESHOLD = 0.5
@@ -298,6 +298,7 @@ class ATIFAdapter(FrameworkAdapter):
             self._score_trajectories(
                 trajectories,
                 concurrency_limit,
+                max_subagent_depth=max_subagent_depth,
                 failure_threshold=failure_threshold,
                 scoring_mode=scoring_mode,
                 reference_criteria=reference_criteria,
@@ -560,11 +561,6 @@ class ATIFAdapter(FrameworkAdapter):
 
         def validate(current: Trajectory, location: str, depth: int) -> None:
             nonlocal total_steps
-            if depth > max_subagent_depth:
-                raise ATIFLoadError(
-                    f"{source}: {location} exceeds maximum subagent depth "
-                    f"of {max_subagent_depth}"
-                )
             if len(current.steps) > max_steps_per_trajectory:
                 raise ATIFLoadError(
                     f"{source}: {location} contains {len(current.steps)} steps; "
@@ -874,6 +870,7 @@ class ATIFAdapter(FrameworkAdapter):
         trajectories: list[dict[str, Any]],
         concurrency_limit: int,
         *,
+        max_subagent_depth: int = MAX_SUBAGENT_DEPTH,
         failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
         scoring_mode: str = DEFAULT_SCORING_MODE,
         reference_criteria: dict[str, Any] | None = None,
@@ -886,6 +883,8 @@ class ATIFAdapter(FrameworkAdapter):
         judge_initial_backoff_seconds: float = 0.5,
         max_judge_requests: int | None = None,
     ) -> list[dict[str, Any]]:
+        if max_subagent_depth < 0:
+            raise ValueError("max_subagent_depth must be non-negative")
         semaphore = asyncio.Semaphore(max(1, concurrency_limit))
         self._judge_timeout_seconds = judge_timeout_seconds
         self._judge_max_attempts = judge_max_attempts
@@ -910,13 +909,28 @@ class ATIFAdapter(FrameworkAdapter):
         first_done = False
 
         async def score_one(
-            index: int, trajectory: dict[str, Any], ancestors: frozenset[int] = frozenset()
+            index: int,
+            trajectory: dict[str, Any],
+            depth: int = 0,
+            ancestors: frozenset[str] = frozenset(),
+            object_ancestors: frozenset[int] = frozenset(),
+            descend: bool = True,
         ) -> dict[str, Any]:
             nonlocal first_done
+            agent = trajectory.get("agent") or {}
+            agent_name = agent.get("name", f"trajectory-{index}")
+            object_id = id(trajectory)
+            circular = agent_name in ancestors
             try:
-                object_id = id(trajectory)
-                if object_id in ancestors:
+                if object_id in object_ancestors:
                     raise ATIFLoadError("cycle detected in nested subagent trajectories")
+                if circular:
+                    logger.warning(
+                        "ATIF circular delegation detected: agent=%s trajectory=%s; "
+                        "scoring trajectory in isolation",
+                        agent_name,
+                        trajectory.get("trajectory_id", f"trajectory-{index}"),
+                    )
                 async with semaphore:
                     details = await self._score_single_trajectory_details(
                         trajectory,
@@ -946,24 +960,55 @@ class ATIFAdapter(FrameworkAdapter):
                     "step_count": len(trajectory.get("steps", [])),
                     "subagent_trajectories": [],
                 }
-            children = [
-                await score_one(
-                    child_index,
-                    child,
-                    ancestors | {object_id},
+            children: list[dict[str, Any]] = []
+            nested = trajectory.get("subagent_trajectories") or []
+            if circular or not descend:
+                pass
+            elif depth >= max_subagent_depth and nested:
+                logger.warning(
+                    "ATIF subagent depth limit reached at trajectory=%s depth=%d "
+                    "limit=%d; scoring child trajectories without further descent",
+                    trajectory.get("trajectory_id", f"trajectory-{index}"),
+                    depth,
+                    max_subagent_depth,
                 )
-                for child_index, child in enumerate(
-                    trajectory.get("subagent_trajectories") or []
-                )
-            ]
+                children = [
+                    await score_one(
+                        child_index,
+                        child,
+                        depth + 1,
+                        ancestors | {agent_name},
+                        object_ancestors | {object_id},
+                        False,
+                    )
+                    for child_index, child in enumerate(nested)
+                ]
+            else:
+                children = [
+                    await score_one(
+                        child_index,
+                        child,
+                        depth + 1,
+                        ancestors | {agent_name},
+                        object_ancestors | {object_id},
+                    )
+                    for child_index, child in enumerate(nested)
+                ]
             own_score = details["score"]
-            child_scores = [
-                child["aggregate_score"]
-                for child in children
-                if child.get("status", "scored") == "scored"
-            ]
-            all_scores = [own_score, *child_scores]
-            aggregate_score = sum(all_scores) / len(all_scores)
+            own_step_count = len(trajectory.get("steps", []))
+            weighted_scores = [(own_score, own_step_count)]
+            for child in children:
+                if child.get("status", "scored") == "scored":
+                    weighted_scores.append(
+                        (child["aggregate_score"], child["total_step_count"])
+                    )
+            total_step_count = sum(weight for _, weight in weighted_scores)
+            aggregate_score = (
+                sum(score * weight for score, weight in weighted_scores)
+                / total_step_count
+                if total_step_count
+                else 0.0
+            )
             if not first_done:
                 first_done = True
                 elapsed = time.monotonic() - start
@@ -973,7 +1018,8 @@ class ATIFAdapter(FrameworkAdapter):
                 "trajectory_id": trajectory.get("trajectory_id", f"trajectory-{index}"),
                 "source_path": trajectory.get("_source_path"),
                 **details,
-                "step_count": len(trajectory.get("steps", [])),
+                "step_count": own_step_count,
+                "total_step_count": total_step_count,
                 "subagent_trajectories": children,
                 "aggregate_score": aggregate_score,
                 "status": "scored",

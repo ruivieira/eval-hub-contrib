@@ -72,6 +72,14 @@ parameters:
     type: integer
     default: 500
     description: Maximum number of steps allowed in each trajectory, including nested subagents
+  - name: max_subagent_depth
+    type: integer
+    default: 3
+    description: Maximum recursive subagent depth; trajectories at the limit are scored without further descent
+  - name: subagent_aggregation
+    type: string
+    default: flat
+    description: Aggregation mode for nested trajectories; parent aggregates use step-count-weighted means
   - name: failure_threshold
     type: float
     default: 0.5

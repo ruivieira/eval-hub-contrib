@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import httpx
@@ -889,8 +890,8 @@ def test_load_rejects_nested_depth_and_total_step_limits(tmp_path: Path):
     trajectory_file = _write_json(tmp_path / "nested.json", trajectory)
     adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
 
-    with pytest.raises(ATIFLoadError, match="maximum subagent depth"):
-        adapter._load_trajectories([trajectory_file], max_subagent_depth=0)
+    loaded = adapter._load_trajectories([trajectory_file], max_subagent_depth=0)
+    assert loaded[0]["subagent_trajectories"]
     with pytest.raises(ATIFLoadError, match="total steps"):
         adapter._load_trajectories([trajectory_file], max_total_steps=2)
 
@@ -987,6 +988,103 @@ def test_subagent_aggregation_modes_are_explicit(job_spec, tmp_path):
             )
             result = adapter.run_benchmark_job(spec, callbacks)
         assert result.overall_score == pytest.approx(expected)
+
+
+def test_parent_aggregate_uses_step_count_weighting(job_spec, tmp_path):
+    trajectory = _valid_trajectory()
+    trajectory["agent"]["name"] = "parent-agent"
+    trajectory["steps"] = [trajectory["steps"][0]]
+    child = _valid_trajectory()
+    child["trajectory_id"] = "child"
+    child["agent"]["name"] = "child-agent"
+    child["steps"] = [
+        {**child["steps"][0], "step_id": 1},
+        {**child["steps"][0], "step_id": 2},
+        {**child["steps"][0], "step_id": 3},
+    ]
+    trajectory["subagent_trajectories"] = [child]
+    trajectory_file = _write_json(tmp_path / "weighted.json", trajectory)
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+    spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "trajectory_path": str(trajectory_file),
+                "subagent_aggregation": "hierarchical",
+                "concurrency_limit": 1,
+            }
+        }
+    )
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=json.dumps({"score": 0.0})),
+                Response(
+                    200,
+                    text=json.dumps(
+                        {"category": "reasoning_failure", "confidence": 1.0}
+                    ),
+                ),
+                Response(200, text=json.dumps({"score": 1.0})),
+                Response(200, text=json.dumps({"score": 1.0})),
+                Response(200, text=json.dumps({"score": 1.0})),
+            ]
+        )
+        result = adapter.run_benchmark_job(spec, callbacks)
+
+    parent = result.evaluation_metadata["atif_trajectories"][0]
+    assert parent["aggregate_score"] == pytest.approx(0.75)
+    assert parent["total_step_count"] == 4
+
+
+def test_circular_agent_identity_is_logged_and_scored_in_isolation(
+    job_spec, tmp_path, caplog
+):
+    trajectory = _valid_trajectory()
+    trajectory["agent"]["name"] = "same-agent"
+    child = _valid_trajectory()
+    child["trajectory_id"] = "child"
+    child["agent"]["name"] = "same-agent"
+    grandchild = _valid_trajectory()
+    grandchild["trajectory_id"] = "grandchild"
+    grandchild["agent"]["name"] = "grandchild-agent"
+    child["subagent_trajectories"] = [grandchild]
+    trajectory["subagent_trajectories"] = [child]
+    trajectory_file = _write_json(tmp_path / "circular.json", trajectory)
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+    spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "trajectory_path": str(trajectory_file),
+                "concurrency_limit": 1,
+            }
+        }
+    )
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=json.dumps({"score": 0.8})),
+                Response(200, text=json.dumps({"score": 0.8})),
+                Response(200, text=json.dumps({"score": 0.6})),
+                Response(200, text=json.dumps({"score": 0.6})),
+            ]
+        )
+        with caplog.at_level(logging.WARNING):
+            result = adapter.run_benchmark_job(spec, callbacks)
+
+    child_result = result.evaluation_metadata["atif_trajectories"][0][
+        "subagent_trajectories"
+    ][0]
+    assert child_result["score"] == pytest.approx(0.6)
+    assert child_result["subagent_trajectories"] == []
+    assert "circular delegation detected" in caplog.text
 
 
 def test_judge_429_retry(job_spec):

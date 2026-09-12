@@ -94,7 +94,7 @@ Parameters are supplied through the EvalHub job's generic `parameters` object.
 | `max_file_bytes` | integer | `10485760` | Maximum size of an individual input file in bytes. Must be positive. |
 | `max_trajectory_files` | integer | `10000` | Maximum number of discovered JSON files. Must be positive. |
 | `max_steps_per_trajectory` | integer | `500` | Maximum number of steps in each trajectory, including nested subagents. |
-| `max_subagent_depth` | integer | `8` | Maximum embedded-subagent depth below a root trajectory. Depth `0` disables nested trajectories. |
+| `max_subagent_depth` | integer | `3` | Maximum embedded-subagent depth below a root trajectory. At the limit, child trajectories are scored without further descent. |
 | `max_total_steps` | integer | `10000` | Maximum number of steps in one complete trajectory tree. |
 | `subagent_aggregation` | string | `flat` | `flat` averages every scored trajectory, `hierarchical` averages each parent with its descendants, and `separate` reports only root scores in the overall aggregate while retaining nested results. |
 | `failure_threshold` | float | `0.5` | Scores strictly below this value are treated as detectable failures and sent for categorization. Must be in `[0, 1]`. |
@@ -290,10 +290,12 @@ PYTHONPATH=. pytest -q tests/test_failure_categorization_acceptance.py
 
 Embedded `subagent_trajectories` are scored recursively and retained under
 their parent in `evaluation_metadata["atif_trajectories"]`. Each trajectory has
-its own `score`; parents also expose `aggregate_score`. Nested trajectory IDs
-must be unique across the complete input collection. The depth and total-step
-limits prevent unbounded work, and cyclic in-memory structures are rejected by
-the scoring helper.
+its own `score`; parents also expose `aggregate_score`. Parent aggregates use
+the trajectory step counts as weights, including recursively aggregated child
+scores. Nested trajectory IDs must be unique across the complete input
+collection. The depth and total-step limits prevent unbounded work. Repeated
+ancestor agent identities are logged as circular delegations and scored in
+isolation without further descent.
 
 The default `flat` mode includes root and nested scores in the overall mean.
 `hierarchical` rolls each child aggregate into its parent before calculating
