@@ -27,8 +27,10 @@ from evalhub.adapter import (
     JobStatusUpdate,
     MessageInfo,
     EnvironmentCardMetadata,
+    TrajectoryScore,
 )
 from evalhub.adapter.auth import resolve_model_credentials
+from evalhub.adapter.mlflow import MlflowArtifact
 from evalhub.adapter.telemetry import EvalTracer
 from evalhub.models.atif import Trajectory
 from rubric_registry import RubricRegistry
@@ -216,14 +218,9 @@ class ATIFAdapter(FrameworkAdapter):
         )
         if not 0.0 <= completion_threshold <= 1.0:
             raise ValueError("completion_threshold must be between 0 and 1")
-        training_threshold_value = params.get("training_threshold")
-        training_threshold = (
-            float(training_threshold_value)
-            if training_threshold_value is not None
-            else None
+        training_threshold = self._parse_training_threshold(
+            params.get("training_threshold")
         )
-        if training_threshold is not None and not 0.0 <= training_threshold <= 1.0:
-            raise ValueError("training_threshold must be between 0 and 1")
 
         reference_criteria: dict[str, Any] | None = None
         reference_fixtures: dict[str, Any] | None = None
@@ -390,7 +387,19 @@ class ATIFAdapter(FrameworkAdapter):
             )
         )
 
-        return JobResults(
+        trajectory_results = [
+            TrajectoryScore(
+                trajectory_id=item.get("trajectory_id"),
+                source_path=item.get("source_path"),
+                score=item.get("score"),
+                aggregate_score=item.get("aggregate_score"),
+                status=item.get("status", "scored"),
+                training_eligible=item.get("training_eligible"),
+            )
+            for item in self._flatten_scored_trajectories(scored)
+        ]
+
+        result = JobResults(
             id=config.id,
             benchmark_id=config.benchmark_id,
             benchmark_index=config.benchmark_index,
@@ -416,6 +425,7 @@ class ATIFAdapter(FrameworkAdapter):
             num_examples_evaluated=len(scored_for_metrics),
             duration_seconds=time.monotonic() - start_time,
             completed_at=datetime.now(UTC),
+            trajectory_results=trajectory_results,
             evaluation_metadata={
                 "atif_trajectories": scored,
                 "atif_trajectory_metadata": [
@@ -463,6 +473,23 @@ class ATIFAdapter(FrameworkAdapter):
             env_card=self._build_environment_card(trajectories),
         )
 
+        # Detailed results belong in MLflow as downloadable artifacts, not in the
+        # EvalHub completion-event payload.  When training selection is enabled,
+        # keep the eligible and ineligible cohorts separately addressable without
+        # uploading a third, duplicate copy of the complete result tree.
+        mlflow = getattr(callbacks, "mlflow", None)
+        if mlflow is not None:
+            artifacts = self._build_mlflow_artifacts(result, training_threshold)
+            run_id = mlflow.save(
+                result,
+                config,
+                artifacts=artifacts,
+            )
+            if run_id:
+                result.mlflow_run_id = run_id
+
+        return result
+
     @staticmethod
     def _validate_job_spec(config: JobSpec) -> JobSpec:
         """Validate the framework contract before starting adapter work."""
@@ -471,6 +498,84 @@ class ATIFAdapter(FrameworkAdapter):
             return JobSpec.model_validate(payload)
         except ValidationError as exc:
             raise ValueError(f"Invalid ATIF JobSpec: {exc}") from exc
+
+    @staticmethod
+    def _parse_training_threshold(value: Any) -> float | None:
+        """Validate the optional training threshold before loading job data."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise ValueError("training_threshold must be a float between 0 and 1")
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "training_threshold must be a float between 0 and 1"
+            ) from exc
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("training_threshold must be a float between 0 and 1")
+        return threshold
+
+    @classmethod
+    def _build_mlflow_artifacts(
+        cls, result: JobResults, training_threshold: float | None
+    ) -> list[MlflowArtifact]:
+        """Serialize detailed results for MLflow without putting them in the API event.
+
+        A threshold-enabled run is split into two disjoint artifacts so consumers
+        can download only the cohort they need. Failed trajectories are retained
+        in the ineligible artifact because they are not safe training inputs.
+        Without a threshold, the original single-artifact behavior is preserved.
+        """
+        if training_threshold is None:
+            payload = json.dumps(
+                result.model_dump(mode="json"), ensure_ascii=False, indent=2
+            ).encode("utf-8")
+            return [
+                MlflowArtifact(
+                    "atif/evaluation_results.json", payload, "application/json"
+                )
+            ]
+
+        scored = result.evaluation_metadata.get("atif_trajectories", [])
+        flattened = cls._flatten_scored_trajectories(scored)
+        cohorts = {
+            "eligible": [
+                item for item in flattened if item.get("training_eligible") is True
+            ],
+            "ineligible": [
+                item for item in flattened if item.get("training_eligible") is not True
+            ],
+        }
+
+        artifacts: list[MlflowArtifact] = []
+        for cohort, trajectories in cohorts.items():
+            source_paths = [
+                item["source_path"]
+                for item in trajectories
+                if item.get("source_path") is not None
+            ]
+            payload = json.dumps(
+                {
+                    "schema_version": 1,
+                    "selection": cohort,
+                    "training_threshold": training_threshold,
+                    "trajectory_count": len(trajectories),
+                    "source_paths": source_paths,
+                    "manifest": source_paths if cohort == "eligible" else [],
+                    "trajectories": trajectories,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            artifacts.append(
+                MlflowArtifact(
+                    f"atif/training/{cohort}_trajectories.json",
+                    payload,
+                    "application/json",
+                )
+            )
+        return artifacts
 
     @staticmethod
     def _extract_trajectory_metadata(trajectory: dict[str, Any]) -> dict[str, Any]:
@@ -672,9 +777,24 @@ class ATIFAdapter(FrameworkAdapter):
                     trajectory_sources[current.trajectory_id] = file
                 pending.extend(current.subagent_trajectories or [])
             trajectory = parsed.model_dump(mode="json")
-            trajectory["_source_path"] = str(file)
+            trajectory["_source_path"] = self._source_path_for_manifest(file)
             trajectories.append(trajectory)
         return trajectories
+
+    @staticmethod
+    def _source_path_for_manifest(file: Path) -> str:
+        """Return the original S3 path when runtime metadata is available."""
+        bucket = os.environ.get("TEST_DATA_S3_BUCKET", "").strip()
+        prefix = os.environ.get("TEST_DATA_S3_KEY", "").strip().strip("/")
+        test_data_root = Path("/test_data")
+        if bucket and prefix:
+            try:
+                relative = file.relative_to(test_data_root).as_posix()
+            except ValueError:
+                relative = ""
+            if relative:
+                return f"s3://{bucket}/{prefix}/{relative}"
+        return str(file)
 
     @staticmethod
     def _load_reference_registry(

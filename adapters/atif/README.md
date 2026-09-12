@@ -8,8 +8,8 @@ publishes aggregate scores and failure-categorization metadata.
 
 This adapter supports local files and mounted directories. It provides
 auto-scoring, adapter-local custom rubrics, and a file-backed
-benchmark/reference flow. S3-backed input discovery, typed training manifests,
-and report attachments are not implemented by this adapter.
+benchmark/reference flow. Detailed training-selection results are stored in
+MLflow rather than returned through the EvalHub API.
 
 ## How it works
 
@@ -29,7 +29,8 @@ For each EvalHub job, the adapter:
 8. Aggregates step scores into a trajectory score and then an overall score.
 9. Optionally marks trajectories as training-eligible when their score meets
    `training_threshold`.
-10. Returns EvalHub metrics and detailed generic evaluation metadata.
+10. Uploads detailed training-selection results to MLflow when configured.
+11. Returns compact EvalHub metrics and the MLflow run ID.
 
 In Kubernetes, the adapter calls the judge through the runtime sidecar at:
 
@@ -382,11 +383,22 @@ The detailed result is JSON serializable through the SDK `JobResults` model
 greater than or equal to `completion_threshold`; this status is independent of
 failure categorization and training eligibility.
 
-When `training_threshold` is set, `atif_training_manifest` contains the local
-source paths of trajectories whose aggregate score meets the threshold. These
-are generic metadata fields. A typed SDK `training_manifest` field, original
-S3 paths, and a downloadable report attachment require downstream EvalHub and
-SDK support.
+When `training_threshold` is set, trajectories are classified using
+`aggregate_score >= training_threshold`. When MLflow is configured, the adapter
+uploads two JSON artifacts in the same run:
+
+- `atif/training/eligible_trajectories.json`
+- `atif/training/ineligible_trajectories.json`
+
+The artifacts contain detailed trajectory and step results, eligibility,
+threshold, counts, and source paths. For S3-backed test data, source paths are
+reported as their original `s3://` URIs; local and PVC inputs retain their
+filesystem paths. Failed trajectories are included in the ineligible artifact.
+The EvalHub completion event contains only aggregate
+metrics and the MLflow run ID; it does not contain the detailed trajectory tree
+or training manifest. MLflow also records the threshold and cohort counts as
+searchable run parameters. Without a threshold, the adapter preserves the
+single `atif/evaluation_results.json` artifact behavior.
 
 `atif_trajectory_metadata` contains the parsed schema version, trajectory and
 session identity, task instruction, agent name/version, model, tool-definition
@@ -441,7 +453,8 @@ configured model routing, and local HTTPS endpoints with optional CA bundles.
   checkpointing are not implemented.
 - Per-step judge diagnostics are limited; full structured redacted diagnostics
   and typed result fields require additional work.
-- Training eligibility is exposed through generic metadata only. It does not
-  yet create a typed SDK field or report attachment.
+- Training eligibility is exposed through the typed SDK trajectory summaries and
+  detailed MLflow artifacts; the completion API intentionally carries only the
+  MLflow run ID and aggregate metrics.
 - Production image promotion, dependency onboarding, and release management
   are outside this adapter directory.

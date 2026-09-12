@@ -42,6 +42,15 @@ class FakeCallbacks(JobCallbacks):
         pass
 
 
+class FakeMlflow:
+    def __init__(self):
+        self.calls = []
+
+    def save(self, results, job_spec, artifacts=None):
+        self.calls.append((results, job_spec, artifacts or []))
+        return "mlflow-run-1"
+
+
 def test_atif_adapter_happy_path(job_spec):
     adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
     callbacks = FakeCallbacks()
@@ -156,6 +165,61 @@ def test_training_eligibility_marks_trajectories_and_manifest(job_spec):
     assert result.evaluation_metadata["atif_training_threshold"] == 0.65
     assert result.evaluation_metadata["atif_training_manifest"] == [
         trajectory["source_path"]
+    ]
+
+
+def test_training_manifest_preserves_original_s3_source(monkeypatch):
+    monkeypatch.setenv("TEST_DATA_S3_BUCKET", "training-data")
+    monkeypatch.setenv("TEST_DATA_S3_KEY", "datasets/atif")
+
+    assert ATIFAdapter._source_path_for_manifest(Path("/test_data/run/t1.json")) == (
+        "s3://training-data/datasets/atif/run/t1.json"
+    )
+
+
+def test_training_results_are_uploaded_to_mlflow_as_split_artifacts(job_spec):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+    callbacks.mlflow = FakeMlflow()
+    job_spec = job_spec.model_copy(
+        update={
+            "parameters": {
+                **(job_spec.parameters or {}),
+                "training_threshold": 0.65,
+            }
+        }
+    )
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=json.dumps({"score": 0.8})),
+                Response(200, text=json.dumps({"score": 0.6})),
+            ]
+        )
+        result = adapter.run_benchmark_job(job_spec, callbacks)
+
+    assert result.mlflow_run_id == "mlflow-run-1"
+    assert len(callbacks.mlflow.calls) == 1
+    _, saved_spec, artifacts = callbacks.mlflow.calls[0]
+    assert saved_spec == job_spec
+    assert [artifact.path for artifact in artifacts] == [
+        "atif/training/eligible_trajectories.json",
+        "atif/training/ineligible_trajectories.json",
+    ]
+    eligible_payload = json.loads(artifacts[0].content)
+    ineligible_payload = json.loads(artifacts[1].content)
+    assert eligible_payload["selection"] == "eligible"
+    assert eligible_payload["trajectory_count"] == 1
+    assert eligible_payload["trajectories"][0]["training_eligible"] is True
+    assert eligible_payload["source_paths"]
+    assert ineligible_payload["selection"] == "ineligible"
+    assert ineligible_payload["trajectory_count"] == 0
+
+    full_artifacts = adapter._build_mlflow_artifacts(result, None)
+    assert [artifact.path for artifact in full_artifacts] == [
+        "atif/evaluation_results.json"
     ]
 
 
@@ -549,7 +613,7 @@ def test_custom_scoring_rejects_incomplete_judge_response(job_spec):
             adapter.run_benchmark_job(job_spec, callbacks)
 
 
-@pytest.mark.parametrize("training_threshold", [-0.1, 1.1])
+@pytest.mark.parametrize("training_threshold", [-0.1, 1.1, float("nan"), True, "invalid"])
 def test_invalid_training_threshold_fails_fast(job_spec, training_threshold):
     adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
     callbacks = FakeCallbacks()
