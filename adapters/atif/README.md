@@ -53,6 +53,10 @@ The adapter uses the SDK's `Trajectory` model for validation. It currently
 accepts the schema versions exposed by the installed SDK, including
 `ATIF-v1.0` through `ATIF-v1.8` in the validated environment.
 
+The canonical ATIF field is `schema_version`. For compatibility with the
+adapter ticket contract, `atif_schema_version` is also accepted as an alias;
+if both fields are present, they must agree.
+
 Each trajectory must contain valid ATIF data. Duplicate non-null
 `trajectory_id` values across files are rejected. Empty collections, malformed
 JSON, unsupported schema versions, oversized files, and trajectories exceeding
@@ -263,6 +267,7 @@ The EvalHub `overall_score` is set to `atif_overall_score`, and
 
 ```text
 atif_trajectories
+atif_trajectory_metadata
 atif_scoring_mode
 atif_failure_threshold
 atif_detectable_failure_count
@@ -289,6 +294,12 @@ source paths of trajectories whose aggregate score meets the threshold. These
 are generic metadata fields. A typed SDK `training_manifest` field, original
 S3 paths, and a downloadable report attachment require downstream EvalHub and
 SDK support.
+
+`atif_trajectory_metadata` contains the parsed schema version, trajectory and
+session identity, task instruction, agent name/version, model, tool-definition
+count, and the original steps including tool calls, observations, and reasoning
+traces. The same identity is emitted in the typed SDK Environment Card under
+`env_card.custom`.
 
 ## Provider and container
 

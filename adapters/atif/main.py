@@ -24,6 +24,7 @@ from evalhub.adapter import (
     JobStatus,
     JobStatusUpdate,
     MessageInfo,
+    EnvironmentCardMetadata,
 )
 from evalhub.adapter.auth import resolve_model_credentials
 from evalhub.models.atif import Trajectory
@@ -268,6 +269,10 @@ class ATIFAdapter(FrameworkAdapter):
             completed_at=datetime.now(UTC),
             evaluation_metadata={
                 "atif_trajectories": scored,
+                "atif_trajectory_metadata": [
+                    self._extract_trajectory_metadata(trajectory)
+                    for trajectory in trajectories
+                ],
                 "atif_scoring_mode": scoring_mode,
                 "atif_subagent_aggregation": subagent_aggregation,
                 "atif_subagent_depth_limit": max_subagent_depth,
@@ -290,6 +295,7 @@ class ATIFAdapter(FrameworkAdapter):
                 "atif_training_threshold": training_threshold,
                 "atif_training_manifest": eligible_paths,
             },
+            env_card=self._build_environment_card(trajectories),
         )
 
     @staticmethod
@@ -300,6 +306,49 @@ class ATIFAdapter(FrameworkAdapter):
             return JobSpec.model_validate(payload)
         except ValidationError as exc:
             raise ValueError(f"Invalid ATIF JobSpec: {exc}") from exc
+
+    @staticmethod
+    def _extract_trajectory_metadata(trajectory: dict[str, Any]) -> dict[str, Any]:
+        """Extract ATIF fields needed by downstream cards and consumers."""
+        agent = trajectory.get("agent") or {}
+        steps = trajectory.get("steps") or []
+        return {
+            "trajectory_id": trajectory.get("trajectory_id"),
+            "session_id": trajectory.get("session_id"),
+            "atif_schema_version": trajectory.get("schema_version"),
+            "task_instruction": (trajectory.get("extra") or {}).get(
+                "task_instruction"
+            ),
+            "agent_name": agent.get("name"),
+            "agent_version": agent.get("version"),
+            "model": agent.get("model_name"),
+            "tool_definitions_count": len(agent.get("tool_definitions") or []),
+            "steps": steps,
+        }
+
+    @classmethod
+    def _build_environment_card(
+        cls, trajectories: list[dict[str, Any]]
+    ) -> EnvironmentCardMetadata:
+        """Capture runtime context and expose ATIF identity in the Environment Card."""
+        card = EnvironmentCardMetadata.capture(framework_name="ATIF")
+        metadata = [cls._extract_trajectory_metadata(item) for item in trajectories]
+        first = metadata[0] if metadata else {}
+        return card.model_copy(
+            update={
+                "model_id": first.get("model"),
+                "model_version": first.get("agent_version"),
+                "custom": {
+                    "atif_schema_version": first.get("atif_schema_version"),
+                    "agent_name": first.get("agent_name"),
+                    "agent_version": first.get("agent_version"),
+                    "model": first.get("model"),
+                    "tool_definitions_count": first.get("tool_definitions_count", 0),
+                    "trajectory_count": len(metadata),
+                    "trajectories": metadata,
+                },
+            }
+        )
 
     def _discover_atif_files(self, uri: str) -> list[Path]:
         path = Path(uri)
@@ -414,7 +463,20 @@ class ATIFAdapter(FrameworkAdapter):
                 data = json.loads(file.read_text(encoding="utf-8"))
                 if not isinstance(data, dict):
                     raise ATIFLoadError("top-level JSON value must be an object")
-                schema_version = data.get("schema_version", "ATIF-v1.8")
+                data = dict(data)
+                ticket_schema_version = data.pop("atif_schema_version", None)
+                schema_version = data.get(
+                    "schema_version", ticket_schema_version or "ATIF-v1.8"
+                )
+                if (
+                    ticket_schema_version is not None
+                    and "schema_version" in data
+                    and ticket_schema_version != data["schema_version"]
+                ):
+                    raise ATIFLoadError(
+                        "conflicting schema_version and atif_schema_version values"
+                    )
+                data["schema_version"] = schema_version
                 if (
                     not isinstance(schema_version, str)
                     or schema_version not in supported_versions

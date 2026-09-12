@@ -473,6 +473,47 @@ def test_load_valid_trajectory_uses_sdk_model(tmp_path: Path):
     assert loaded[0]["trajectory_id"] == "t1"
 
 
+def test_load_v17_trajectory_extracts_atif_fields():
+    fixture = Path(__file__).parent / "fixtures" / "trajectory_v1_7.json"
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    loaded = adapter._load_trajectories([fixture])
+    metadata = adapter._extract_trajectory_metadata(loaded[0])
+
+    assert metadata["atif_schema_version"] == "ATIF-v1.7"
+    assert metadata["trajectory_id"] == "v17-trajectory"
+    assert metadata["task_instruction"].startswith("Find the answer")
+    assert metadata["agent_name"] == "fixture-agent"
+    assert metadata["agent_version"] == "2.1.0"
+    assert metadata["model"] == "fixture-model"
+    assert metadata["tool_definitions_count"] == 1
+    assert metadata["steps"][0]["tool_calls"][0]["function_name"] == "search"
+    assert metadata["steps"][0]["observation"]["results"][0]["content"] == (
+        "ATIF search result"
+    )
+    assert metadata["steps"][0]["reasoning_content"].startswith("The tool")
+
+    card = adapter._build_environment_card(loaded)
+    assert card.framework_name == "ATIF"
+    assert card.model_id == "fixture-model"
+    assert card.model_version == "2.1.0"
+    assert card.custom["agent_name"] == "fixture-agent"
+    assert card.custom["tool_definitions_count"] == 1
+    assert card.custom["atif_schema_version"] == "ATIF-v1.7"
+
+
+def test_load_accepts_ticket_schema_version_alias(tmp_path: Path):
+    trajectory = _valid_trajectory()
+    trajectory.pop("schema_version")
+    trajectory["atif_schema_version"] = "ATIF-v1.7"
+    trajectory_file = _write_json(tmp_path / "ticket-version.json", trajectory)
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    loaded = adapter._load_trajectories([trajectory_file])
+
+    assert loaded[0]["schema_version"] == "ATIF-v1.7"
+
+
 def test_supported_schema_versions_come_from_sdk_model():
     assert ATIFAdapter._supported_schema_versions() == frozenset(
         f"ATIF-v1.{version}" for version in range(9)
@@ -486,6 +527,24 @@ def test_load_rejects_malformed_json(tmp_path: Path):
 
     with pytest.raises(ATIFLoadError, match="invalid ATIF trajectory"):
         adapter._load_trajectories([trajectory_file])
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "message"),
+    [
+        ("malformed_trajectory.json", "invalid ATIF trajectory"),
+        ("invalid_trajectory.json", "expected 2"),
+        ("unsupported_schema_version.json", "unsupported schema_version"),
+    ],
+)
+def test_representative_invalid_fixtures_have_clear_diagnostics(
+    fixture_name: str, message: str
+):
+    fixture = Path(__file__).parent / "fixtures" / fixture_name
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    with pytest.raises(ATIFLoadError, match=message):
+        adapter._load_trajectories([fixture])
 
 
 def test_load_rejects_invalid_trajectory_using_sdk_validation(tmp_path: Path):
