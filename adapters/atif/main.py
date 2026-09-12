@@ -44,6 +44,7 @@ DEFAULT_REFERENCE_RUBRIC = "default"
 MAX_CUSTOM_RUBRIC_BYTES = 16 * 1024
 MAX_CUSTOM_CRITERIA = 32
 MAX_CUSTOM_TEXT_LENGTH = 2_000
+MAX_JUDGE_ATTEMPTS = 10
 FAILURE_CATEGORIES = frozenset(
     {
         "tool_selection_failure",
@@ -59,6 +60,10 @@ class ATIFLoadError(ValueError):
 
 class JudgeResponseError(ValueError):
     """Raised when the judge does not return a valid score response."""
+
+
+class JudgeRequestLimitError(RuntimeError):
+    """Raised when an evaluation exceeds its configured judge request budget."""
 
 
 class ReferenceRegistryError(ValueError):
@@ -100,6 +105,38 @@ class ATIFAdapter(FrameworkAdapter):
             params.get("max_subagent_depth", MAX_SUBAGENT_DEPTH)
         )
         max_total_steps = int(params.get("max_total_steps", MAX_TOTAL_STEPS))
+        partial_result_policy = str(
+            params.get("partial_result_policy", "fail_fast")
+        ).lower()
+        if partial_result_policy not in {"fail_fast", "skip_failed_trajectory"}:
+            raise ValueError(
+                "partial_result_policy must be 'fail_fast' or "
+                "'skip_failed_trajectory'"
+            )
+        judge_timeout_seconds = float(params.get("judge_timeout_seconds", 30.0))
+        judge_max_attempts = int(params.get("judge_max_attempts", 3))
+        judge_initial_backoff_seconds = float(
+            params.get("judge_initial_backoff_seconds", 0.5)
+        )
+        max_judge_requests_value = params.get("max_judge_requests")
+        max_judge_requests = (
+            int(max_judge_requests_value)
+            if max_judge_requests_value is not None
+            else None
+        )
+        if not math.isfinite(judge_timeout_seconds) or judge_timeout_seconds <= 0:
+            raise ValueError("judge_timeout_seconds must be positive")
+        if not 1 <= judge_max_attempts <= MAX_JUDGE_ATTEMPTS:
+            raise ValueError(
+                f"judge_max_attempts must be between 1 and {MAX_JUDGE_ATTEMPTS}"
+            )
+        if (
+            not math.isfinite(judge_initial_backoff_seconds)
+            or judge_initial_backoff_seconds < 0
+        ):
+            raise ValueError("judge_initial_backoff_seconds must not be negative")
+        if max_judge_requests is not None and max_judge_requests < 1:
+            raise ValueError("max_judge_requests must be at least 1")
         subagent_aggregation = str(
             params.get("subagent_aggregation", "flat")
         ).lower()
@@ -185,10 +222,17 @@ class ATIFAdapter(FrameworkAdapter):
                 reference_fixtures=reference_fixtures,
                 custom_rubric=custom_rubric,
                 subagent_aggregation=subagent_aggregation,
+                partial_result_policy=partial_result_policy,
+                judge_timeout_seconds=judge_timeout_seconds,
+                judge_max_attempts=judge_max_attempts,
+                judge_initial_backoff_seconds=judge_initial_backoff_seconds,
+                max_judge_requests=max_judge_requests,
             )
         )
         eligible_paths: list[str] = []
         for item in self._flatten_scored_trajectories(scored):
+            if item.get("status") == "failed":
+                continue
             eligible = (
                 None
                 if training_threshold is None
@@ -204,11 +248,22 @@ class ATIFAdapter(FrameworkAdapter):
 
         # Diagnostics always cover the complete scored tree, even when the
         # selected aggregate intentionally reports only top-level trajectories.
-        scored_for_metrics = self._flatten_scored_trajectories(scored)
-        if subagent_aggregation == "hierarchical" and scored:
-            avg_score = sum(item["aggregate_score"] for item in scored) / len(scored)
-        elif subagent_aggregation == "separate" and scored:
-            avg_score = sum(item["score"] for item in scored) / len(scored)
+        scored_for_metrics = [
+            item
+            for item in self._flatten_scored_trajectories(scored)
+            if item.get("status", "scored") == "scored"
+        ]
+        successful_roots = [
+            item for item in scored if item.get("status", "scored") == "scored"
+        ]
+        if subagent_aggregation == "hierarchical" and successful_roots:
+            avg_score = sum(item["aggregate_score"] for item in successful_roots) / len(
+                successful_roots
+            )
+        elif subagent_aggregation == "separate" and successful_roots:
+            avg_score = sum(item["score"] for item in successful_roots) / len(
+                successful_roots
+            )
         elif scored_for_metrics:
             avg_score = sum(item["score"] for item in scored_for_metrics) / len(
                 scored_for_metrics
@@ -306,6 +361,13 @@ class ATIFAdapter(FrameworkAdapter):
                 "atif_failure_categorization_rate": categorization_rate,
                 "atif_training_threshold": training_threshold,
                 "atif_training_manifest": eligible_paths,
+                "atif_partial_result_policy": partial_result_policy,
+                "atif_failed_trajectory_count": sum(
+                    item.get("status") == "failed"
+                    for item in self._flatten_scored_trajectories(scored)
+                ),
+                "atif_judge_request_count": self._judge_request_count,
+                "atif_judge_request_limit": max_judge_requests,
             },
             env_card=self._build_environment_card(trajectories),
         )
@@ -705,13 +767,24 @@ class ATIFAdapter(FrameworkAdapter):
         reference_fixtures: dict[str, Any] | None = None,
         custom_rubric: dict[str, Any] | None = None,
         subagent_aggregation: str = "flat",
+        partial_result_policy: str = "fail_fast",
+        judge_timeout_seconds: float = 30.0,
+        judge_max_attempts: int = 3,
+        judge_initial_backoff_seconds: float = 0.5,
+        max_judge_requests: int | None = None,
     ) -> list[dict[str, Any]]:
+        semaphore = asyncio.Semaphore(max(1, concurrency_limit))
+        self._judge_timeout_seconds = judge_timeout_seconds
+        self._judge_max_attempts = judge_max_attempts
+        self._judge_initial_backoff_seconds = judge_initial_backoff_seconds
+        self._judge_request_limit = max_judge_requests
+        self._judge_request_count = 0
+        self._judge_request_lock = asyncio.Lock()
         criteria = (
             await self._derive_criteria(trajectories[0])
             if scoring_mode == "auto" and trajectories
             else reference_criteria or custom_rubric or {"criteria": []}
         )
-        semaphore = asyncio.Semaphore(max(1, concurrency_limit))
 
         start = time.monotonic()
         first_done = False
@@ -720,21 +793,39 @@ class ATIFAdapter(FrameworkAdapter):
             index: int, trajectory: dict[str, Any], ancestors: frozenset[int] = frozenset()
         ) -> dict[str, Any]:
             nonlocal first_done
-            object_id = id(trajectory)
-            if object_id in ancestors:
-                raise ATIFLoadError("cycle detected in nested subagent trajectories")
-            async with semaphore:
-                details = await self._score_single_trajectory_details(
-                    trajectory,
-                    criteria,
-                    failure_threshold,
-                    reference=(
-                        self._reference_for_trajectory(trajectory, reference_fixtures)
-                        if scoring_mode == "reference" and reference_fixtures is not None
-                        else None
-                    ),
-                    custom_rubric=custom_rubric if scoring_mode == "custom" else None,
+            try:
+                object_id = id(trajectory)
+                if object_id in ancestors:
+                    raise ATIFLoadError("cycle detected in nested subagent trajectories")
+                async with semaphore:
+                    details = await self._score_single_trajectory_details(
+                        trajectory,
+                        criteria,
+                        failure_threshold,
+                        reference=(
+                            self._reference_for_trajectory(trajectory, reference_fixtures)
+                            if scoring_mode == "reference" and reference_fixtures is not None
+                            else None
+                        ),
+                        custom_rubric=custom_rubric if scoring_mode == "custom" else None,
+                    )
+            except Exception as exc:
+                if partial_result_policy == "fail_fast":
+                    raise
+                logger.warning(
+                    "ATIF trajectory scoring failed trajectory=%s: %s",
+                    trajectory.get("trajectory_id", f"trajectory-{index}"),
+                    exc,
                 )
+                return {
+                    "trajectory_id": trajectory.get("trajectory_id", f"trajectory-{index}"),
+                    "source_path": trajectory.get("_source_path"),
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "step_count": len(trajectory.get("steps", [])),
+                    "subagent_trajectories": [],
+                }
             children = [
                 await score_one(
                     child_index,
@@ -746,7 +837,11 @@ class ATIFAdapter(FrameworkAdapter):
                 )
             ]
             own_score = details["score"]
-            child_scores = [child["aggregate_score"] for child in children]
+            child_scores = [
+                child["aggregate_score"]
+                for child in children
+                if child.get("status", "scored") == "scored"
+            ]
             all_scores = [own_score, *child_scores]
             aggregate_score = sum(all_scores) / len(all_scores)
             if not first_done:
@@ -761,6 +856,7 @@ class ATIFAdapter(FrameworkAdapter):
                 "step_count": len(trajectory.get("steps", [])),
                 "subagent_trajectories": children,
                 "aggregate_score": aggregate_score,
+                "status": "scored",
             }
             return result
 
@@ -1058,8 +1154,8 @@ class ATIFAdapter(FrameworkAdapter):
         return result
 
     async def _judge_call(self, payload: dict[str, Any]) -> str:
-        retries = 3
-        delay = 0.5
+        retries = getattr(self, "_judge_max_attempts", 3)
+        delay = getattr(self, "_judge_initial_backoff_seconds", 0.5)
         credentials = resolve_model_credentials()
         headers = {}
         if credentials.api_key:
@@ -1074,21 +1170,53 @@ class ATIFAdapter(FrameworkAdapter):
             "messages": [{"role": "user", "content": json.dumps(payload)}],
         }
         for attempt in range(retries):
+            request_lock = getattr(self, "_judge_request_lock", None)
+            if request_lock is not None:
+                async with request_lock:
+                    limit = getattr(self, "_judge_request_limit", None)
+                    count = getattr(self, "_judge_request_count", 0)
+                    if limit is not None and count >= limit:
+                        raise JudgeRequestLimitError(
+                            f"judge request limit of {limit} exceeded"
+                        )
+                    self._judge_request_count = count + 1
             start = time.monotonic()
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    "http://localhost:8080/v1/chat/completions",
-                    headers=headers,
-                    json=request_body,
-                )
+            try:
+                async with httpx.AsyncClient(
+                    timeout=getattr(self, "_judge_timeout_seconds", 30.0)
+                ) as client:
+                    response = await client.post(
+                        "http://localhost:8080/v1/chat/completions",
+                        headers=headers,
+                        json=request_body,
+                    )
+            except httpx.TimeoutException as exc:
+                if attempt < retries - 1:
+                    logger.warning("ATIF judge request timed out; retrying")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                raise RuntimeError("Judge call timed out after retries") from exc
+            except httpx.HTTPError as exc:
+                if attempt < retries - 1:
+                    logger.warning("ATIF judge request failed; retrying: %s", exc)
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                raise RuntimeError("Judge call failed after retries") from exc
             latency_ms = (time.monotonic() - start) * 1000
             logger.info("atif.judge.call.latency=%s", latency_ms)
             logger.info("atif.judge.call.count=1")
             logger.info("atif.judge.token.count=%s", len(response.text))
-            if response.status_code == 429 and attempt < retries - 1:
-                await asyncio.sleep(delay)
-                delay *= 2
-                continue
+            if response.status_code == 429 or 500 <= response.status_code <= 599:
+                if attempt < retries - 1:
+                    logger.warning(
+                        "ATIF judge returned retryable status %s; retrying",
+                        response.status_code,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
             if response.is_error:
                 logger.error(
                     "atif.judge.call.failed status=%s body=%s",

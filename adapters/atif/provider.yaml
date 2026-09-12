@@ -77,3 +77,22 @@ parameters:
     type: float
     default: 0.5
     description: Score threshold at or above which a trajectory is marked passed
+  - name: judge_timeout_seconds
+    type: float
+    default: 30
+    description: Timeout for each judge HTTP request
+  - name: judge_max_attempts
+    type: integer
+    default: 3
+    description: Maximum attempts for a judge request, including the initial attempt
+  - name: judge_initial_backoff_seconds
+    type: float
+    default: 0.5
+    description: Initial exponential backoff delay for retryable judge failures
+  - name: max_judge_requests
+    type: integer
+    description: Optional maximum number of judge HTTP attempts for the complete job
+  - name: partial_result_policy
+    type: string
+    default: fail_fast
+    description: Use fail_fast or skip_failed_trajectory when a trajectory cannot be scored

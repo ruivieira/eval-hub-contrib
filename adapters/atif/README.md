@@ -88,6 +88,11 @@ Parameters are supplied through the EvalHub job's generic `parameters` object.
 | `failure_threshold` | float | `0.5` | Scores strictly below this value are treated as detectable failures and sent for categorization. Must be in `[0, 1]`. |
 | `completion_threshold` | float | `0.5` | Scores at or above this value mark a trajectory as passed. Must be in `[0, 1]`. |
 | `training_threshold` | float | unset | Optional score threshold for training eligibility. A trajectory is eligible when its aggregate score is greater than or equal to this value. Must be in `[0, 1]`. |
+| `judge_timeout_seconds` | float | `30` | Per-request HTTP timeout. Timeout failures are retried up to `judge_max_attempts` times. |
+| `judge_max_attempts` | integer | `3` | Maximum HTTP attempts per judge request, including the first attempt. 429, 5xx, and transport/timeout failures are retried. |
+| `judge_initial_backoff_seconds` | float | `0.5` | Initial exponential backoff for retryable judge failures. |
+| `max_judge_requests` | integer | unset | Optional job-wide cap on HTTP attempts, including retries. Exceeding it fails the current trajectory. |
+| `partial_result_policy` | string | `fail_fast` | `fail_fast` aborts on the first scoring failure; `skip_failed_trajectory` retains failure metadata and aggregates successful trajectories only. |
 
 The adapter rejects an explicitly supplied invalid threshold before loading
 input. If `training_threshold` is omitted, `training_eligible` is `null` for
@@ -241,14 +246,15 @@ diagnostics include all scored trajectories.
 
 ### Retries and errors
 
-HTTP 429 responses are retried up to three attempts with exponential backoff.
-Other HTTP errors, request failures, invalid score responses, and input
-validation errors during scoring fail the job. A malformed score response is
-therefore visible as an evaluation failure instead of producing a misleading
-successful zero score. A transport failure during the separate categorization
-request is isolated to that step and reported as `judge_error`, so the score
-result remains usable while its categorization rate reflects the missing
-category.
+HTTP 429 and 5xx responses, timeouts, and transport failures are retried up to
+`judge_max_attempts` with exponential backoff. Other HTTP errors, invalid score
+responses, and input validation errors fail the job under the default
+`fail_fast` policy. With `skip_failed_trajectory`, failed trajectories are
+retained in `atif_trajectories` with `status=failed`, error type/message, and
+are excluded from aggregate metrics; successful trajectories still complete.
+The request cap counts every HTTP attempt, including retries. A transport
+failure during separate categorization is isolated to that step and reported
+as `judge_error`.
 
 ## Results
 
@@ -349,7 +355,8 @@ injection into judge prompts, and missing-fixture failures.
   benchmark catalogs are not implemented.
 - Nested `subagent_trajectories` are scored recursively with configurable depth,
   total-step, duplicate-ID, and aggregation controls.
-- Partial-result and resume/checkpoint policies are not implemented.
+- Partial results are supported through `partial_result_policy`, but resume and
+  checkpointing are not implemented.
 - Per-step judge diagnostics are limited; full structured redacted diagnostics
   and typed result fields require additional work.
 - Training eligibility is exposed through generic metadata only. It does not

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 import respx
 from evalhub.adapter import JobCallbacks, JobPhase
@@ -393,12 +395,14 @@ def test_categorization_judge_error_is_separate_from_invalid_response(job_spec):
 
     with respx.mock(assert_all_called=False) as mock:
         mock.post("http://localhost:8080/v1/chat/completions").mock(
-            side_effect=[
-                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
-                Response(200, text=json.dumps({"score": 0.2})),
-                Response(503, text="judge unavailable"),
-                Response(200, text=json.dumps({"score": 0.8})),
-            ]
+                side_effect=[
+                    Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                    Response(200, text=json.dumps({"score": 0.2})),
+                    Response(503, text="judge unavailable"),
+                    Response(503, text="judge unavailable"),
+                    Response(503, text="judge unavailable"),
+                    Response(200, text=json.dumps({"score": 0.8})),
+                ]
         )
 
         result = adapter.run_benchmark_job(job_spec, callbacks)
@@ -770,3 +774,139 @@ def test_judge_429_retry(job_spec):
         result = adapter.run_benchmark_job(job_spec, callbacks)
 
     assert result.overall_score == 0.9
+
+
+def test_steps_are_scored_sequentially(job_spec, monkeypatch):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    seen_steps = []
+
+    async def judge_call(payload):
+        seen_steps.append(payload["step"]["step_id"])
+        await asyncio.sleep(0)
+        return json.dumps({"score": 0.8})
+
+    monkeypatch.setattr(adapter, "_judge_call", judge_call)
+    trajectory = _valid_trajectory()
+    trajectory["steps"].append({**trajectory["steps"][0], "step_id": 3})
+    asyncio.run(
+        adapter._score_single_trajectory_details(
+            trajectory, {"criteria": []}, failure_threshold=0
+        )
+    )
+
+    assert seen_steps == [1, 2, 3]
+
+
+def test_trajectory_concurrency_is_bounded(job_spec, monkeypatch):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    active = 0
+    maximum = 0
+
+    async def derive_criteria(_):
+        return {"criteria": []}
+
+    async def score_details(trajectory, *args, **kwargs):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        active -= 1
+        return {
+            "score": float(trajectory["score"]),
+            "steps": [],
+            "detectable_failure_count": 0,
+            "categorized_failure_count": 0,
+            "uncategorized_failure_count": 0,
+            "categorization_judge_error_count": 0,
+        }
+
+    monkeypatch.setattr(adapter, "_score_single_trajectory_details", score_details)
+    monkeypatch.setattr(adapter, "_derive_criteria", derive_criteria)
+    trajectories = [
+        {"trajectory_id": f"t{i}", "score": i / 10, "steps": []}
+        for i in range(5)
+    ]
+    results = asyncio.run(adapter._score_trajectories(trajectories, 2))
+
+    assert maximum == 2
+    assert [result["trajectory_id"] for result in results] == [f"t{i}" for i in range(5)]
+
+
+def test_skip_failed_trajectory_returns_partial_results(job_spec, monkeypatch):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    async def derive_criteria(_):
+        return {"criteria": []}
+
+    async def score_details(trajectory, *args, **kwargs):
+        if trajectory["trajectory_id"] == "failed":
+            raise RuntimeError("judge unavailable")
+        return {
+            "score": 0.8,
+            "steps": [],
+            "detectable_failure_count": 0,
+            "categorized_failure_count": 0,
+            "uncategorized_failure_count": 0,
+            "categorization_judge_error_count": 0,
+        }
+
+    monkeypatch.setattr(adapter, "_derive_criteria", derive_criteria)
+    monkeypatch.setattr(adapter, "_score_single_trajectory_details", score_details)
+    results = asyncio.run(
+        adapter._score_trajectories(
+            [
+                {"trajectory_id": "failed", "steps": []},
+                {"trajectory_id": "successful", "steps": []},
+            ],
+            2,
+            partial_result_policy="skip_failed_trajectory",
+        )
+    )
+
+    assert results[0]["status"] == "failed"
+    assert results[0]["error_type"] == "RuntimeError"
+    assert results[1]["status"] == "scored"
+
+
+def test_retryable_5xx_is_retried(job_spec, monkeypatch):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post("http://localhost:8080/v1/chat/completions")
+        route.mock(
+            side_effect=[
+                Response(503, text="unavailable"),
+                Response(502, text="bad gateway"),
+                Response(200, text=json.dumps({"score": 0.8})),
+            ]
+        )
+        response = asyncio.run(adapter._judge_call({"request": "score"}))
+
+    assert json.loads(response)["score"] == 0.8
+    assert len(route.calls) == 3
+
+
+def test_timeout_is_retried(job_spec, monkeypatch):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock.post("http://localhost:8080/v1/chat/completions")
+        route.mock(
+            side_effect=[
+                httpx.ReadTimeout("timed out"),
+                Response(200, text=json.dumps({"score": 0.8})),
+            ]
+        )
+        response = asyncio.run(adapter._judge_call({"request": "score"}))
+
+    assert json.loads(response)["score"] == 0.8
+    assert len(route.calls) == 2
