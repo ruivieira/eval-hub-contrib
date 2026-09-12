@@ -133,6 +133,9 @@ class CustomRubricError(ValueError):
 class ATIFAdapter(FrameworkAdapter):
     def run_benchmark_job(self, config: JobSpec, callbacks: JobCallbacks) -> JobResults:
         config = self._validate_job_spec(config)
+        # The invocation's spec is authoritative for model routing. This also
+        # supports local runners and tests that override the loaded spec.
+        self._active_job_spec = config
         start_time = time.monotonic()
         callbacks.report_status(
             JobStatusUpdate(
@@ -1227,6 +1230,7 @@ class ATIFAdapter(FrameworkAdapter):
         delay = getattr(self, "_judge_initial_backoff_seconds", 0.5)
         credentials = resolve_model_credentials()
         headers = {}
+        job_spec = getattr(self, "_active_job_spec", self.job_spec)
         if credentials.api_key:
             api_key = (
                 "api-key:ref"
@@ -1234,8 +1238,19 @@ class ATIFAdapter(FrameworkAdapter):
                 else credentials.api_key
             )
             headers["Authorization"] = f"Bearer {api_key}"
+        model_url = job_spec.model.url.strip().rstrip("/")
+        if not model_url:
+            raise ValueError("model.url is required for the ATIF judge")
+        if os.getenv("EVALHUB_MODE") == "k8s":
+            judge_url = os.getenv("EVALHUB_JUDGE_PROXY_URL", "http://localhost:8080")
+        else:
+            judge_url = model_url
+        if judge_url.endswith("/v1"):
+            judge_url = f"{judge_url}/chat/completions"
+        elif not judge_url.endswith("/v1/chat/completions"):
+            judge_url = f"{judge_url}/v1/chat/completions"
         request_body = {
-            "model": self.job_spec.model.name,
+            "model": job_spec.model.name,
             "messages": [{"role": "user", "content": json.dumps(payload)}],
         }
         for attempt in range(retries):
@@ -1252,10 +1267,16 @@ class ATIFAdapter(FrameworkAdapter):
             start = time.monotonic()
             try:
                 async with httpx.AsyncClient(
-                    timeout=getattr(self, "_judge_timeout_seconds", 30.0)
+                    timeout=getattr(self, "_judge_timeout_seconds", 30.0),
+                    verify=(
+                        str(credentials.ca_cert_path)
+                        if credentials.ca_cert_path
+                        and os.getenv("EVALHUB_MODE") != "k8s"
+                        else True
+                    ),
                 ) as client:
                     response = await client.post(
-                        "http://localhost:8080/v1/chat/completions",
+                        judge_url,
                         headers=headers,
                         json=request_body,
                     )

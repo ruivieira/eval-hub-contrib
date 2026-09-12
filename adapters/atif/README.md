@@ -31,15 +31,25 @@ For each EvalHub job, the adapter:
    `training_threshold`.
 10. Returns EvalHub metrics and detailed generic evaluation metadata.
 
-The adapter calls the judge through the runtime sidecar at:
+In Kubernetes, the adapter calls the judge through the runtime sidecar at:
 
 ```text
 http://localhost:8080/v1/chat/completions
 ```
 
-The judge receives JSON in the OpenAI chat message content. The adapter does
-not make the configured `JobSpec.model.url` request directly; the sidecar is
-responsible for routing and credentials.
+The judge receives JSON in the OpenAI chat message content. `JobSpec.model.url`
+and `JobSpec.model.name` are the authoritative judge configuration. The sidecar
+routes the local proxy request to that URL and resolves `model.auth.secret_ref`.
+The adapter sends only the reference token (`Bearer api-key:ref`) in Kubernetes;
+it never sends a raw mounted credential. Set `EVALHUB_JUDGE_PROXY_URL` only when
+the sidecar uses a non-default local address.
+
+For local or disconnected contract tests, the adapter uses `model.url` directly
+and accepts an OpenAI-compatible `/v1/chat/completions` endpoint. If the URL is
+HTTPS and the resolved local credential directory contains `ca_cert`, that CA
+file is used for TLS verification. In Kubernetes, TLS termination and upstream
+certificate handling belong to the sidecar. No external network access is
+required when `model.url` points to an on-cluster service.
 
 ## Input format
 
@@ -365,6 +375,8 @@ duplicate IDs, malformed input, score validation, genuine zero scores,
 failure categorization, 429 retries, training eligibility, and invalid
 training thresholds. Reference-mode tests cover rubric selection, reference
 injection into judge prompts, and missing-fixture failures.
+Proxy contract tests additionally cover Kubernetes credential indirection,
+configured model routing, and local HTTPS endpoints with optional CA bundles.
 
 ## Current limitations
 

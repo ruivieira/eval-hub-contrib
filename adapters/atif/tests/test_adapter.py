@@ -915,6 +915,59 @@ def test_timeout_is_retried(job_spec, monkeypatch):
     assert len(route.calls) == 2
 
 
+def test_k8s_proxy_uses_job_model_and_reference_credential(job_spec, monkeypatch):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    adapter._active_job_spec = job_spec.model_copy(
+        update={
+            "model": job_spec.model.model_copy(
+                update={
+                    "url": "https://internal-judge.apps.cluster.test/v1",
+                    "name": "cluster-judge",
+                }
+            )
+        }
+    )
+    monkeypatch.setenv("EVALHUB_MODE", "k8s")
+    monkeypatch.setattr(
+        "main.resolve_model_credentials",
+        lambda: type(
+            "Credentials", (), {"api_key": "mounted-secret", "ca_cert_path": None}
+        )(),
+    )
+
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post("http://localhost:8080/v1/chat/completions").mock(
+            return_value=Response(200, json={"score": 0.8})
+        )
+        response = asyncio.run(adapter._judge_call({"request": "score"}))
+
+    assert json.loads(response)["score"] == 0.8
+    request = route.calls[0].request
+    assert request.headers["authorization"] == "Bearer api-key:ref"
+    assert json.loads(request.content)["model"] == "cluster-judge"
+
+
+def test_local_judge_uses_configured_endpoint_and_ca_bundle(job_spec, monkeypatch):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    adapter._active_job_spec = job_spec.model_copy(
+        update={"model": job_spec.model.model_copy(update={"url": "https://judge.internal/v1"})}
+    )
+    monkeypatch.setenv("EVALHUB_MODE", "local")
+    monkeypatch.setattr(
+        "main.resolve_model_credentials",
+        lambda: type(
+            "Credentials", (), {"api_key": None, "ca_cert_path": None}
+        )(),
+    )
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post("https://judge.internal/v1/chat/completions").mock(
+            return_value=Response(200, json={"score": 0.9})
+        )
+        response = asyncio.run(adapter._judge_call({"request": "score"}))
+    assert json.loads(response)["score"] == 0.9
+    assert len(route.calls) == 1
+
+
 def test_judge_telemetry_exports_counts_latency_and_tokens(job_spec, monkeypatch):
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])
