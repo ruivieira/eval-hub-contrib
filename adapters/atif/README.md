@@ -6,10 +6,10 @@ OpenAI-compatible language-model judge. It is an EvalHub provider that loads
 ATIF JSON files, derives evaluation criteria, scores trajectory steps, and
 publishes aggregate scores and failure-categorization metadata.
 
-This adapter is currently an auto-scoring proof of concept. It supports local
-files and mounted directories. S3-backed input discovery, benchmark/reference
-scoring, custom rubrics, nested subagent scoring, typed training manifests, and
-report attachments are not implemented by this adapter.
+This adapter supports local files and mounted directories. It provides
+auto-scoring, adapter-local custom rubrics, and a file-backed
+benchmark/reference flow. S3-backed input discovery, typed training manifests,
+and report attachments are not implemented by this adapter.
 
 ## How it works
 
@@ -20,8 +20,10 @@ For each EvalHub job, the adapter:
 3. Parses each file with the ATIF models from `eval-hub-sdk`.
 4. Validates the ATIF schema version, duplicate trajectory IDs, file size,
    collection size, and step limits.
-5. Calls the runtime-sidecar judge to derive criteria from the first trajectory.
-6. Scores every top-level step in every trajectory concurrently.
+5. Loads a named local reference rubric, loads a validated custom rubric, or
+   asks the runtime-sidecar judge to derive criteria from the first trajectory.
+6. Scores every step in every trajectory, including embedded subagent
+   trajectories, concurrently within the configured judge limit.
 7. Requests a failure category for steps whose score is below
    `failure_threshold`.
 8. Aggregates step scores into a trajectory score and then an overall score.
@@ -67,10 +69,18 @@ Parameters are supplied through the EvalHub job's generic `parameters` object.
 | Parameter | Type | Default | Description |
 | --- | --- | ---: | --- |
 | `trajectory_path` | string | `/test_data/trajectory.json` | Single ATIF JSON file or directory containing ATIF JSON files. |
+| `scoring_mode` | string | `auto` | `auto` derives criteria from the judge; `reference` (or `benchmark`) uses a local reference registry; `custom` uses `custom_rubric` or `custom_rubric_path`. |
+| `reference_registry_path` | string | unset | JSON registry path required for `reference` mode. |
+| `reference_rubric` | string | `default` | Named rubric selected from the registry. |
+| `custom_rubric` | object/string | unset | Inline rubric object or JSON string required for `custom` mode. Mutually exclusive with `custom_rubric_path`. |
+| `custom_rubric_path` | string | unset | Mounted JSON rubric path required for `custom` mode. Maximum size is 16 KiB. |
 | `concurrency_limit` | integer | `10` | Maximum number of top-level trajectories scored concurrently. Values below 1 are clamped to one for scoring. |
 | `max_file_bytes` | integer | `10485760` | Maximum size of an individual input file in bytes. Must be positive. |
 | `max_trajectory_files` | integer | `10000` | Maximum number of discovered JSON files. Must be positive. |
-| `max_steps_per_trajectory` | integer | `500` | Maximum number of steps in each trajectory. The validation also checks nested subagent trajectories, although nested trajectories are not currently scored recursively. |
+| `max_steps_per_trajectory` | integer | `500` | Maximum number of steps in each trajectory, including nested subagents. |
+| `max_subagent_depth` | integer | `8` | Maximum embedded-subagent depth below a root trajectory. Depth `0` disables nested trajectories. |
+| `max_total_steps` | integer | `10000` | Maximum number of steps in one complete trajectory tree. |
+| `subagent_aggregation` | string | `flat` | `flat` averages every scored trajectory, `hierarchical` averages each parent with its descendants, and `separate` reports only root scores in the overall aggregate while retaining nested results. |
 | `failure_threshold` | float | `0.5` | Scores strictly below this value are treated as detectable failures and sent for categorization. Must be in `[0, 1]`. |
 | `training_threshold` | float | unset | Optional score threshold for training eligibility. A trajectory is eligible when its aggregate score is greater than or equal to this value. Must be in `[0, 1]`. |
 
@@ -93,6 +103,73 @@ each trajectory and the training manifest is empty.
 ```
 
 ## Scoring behavior
+
+### Custom scoring
+
+Set `scoring_mode` to `custom` and provide either `custom_rubric` or
+`custom_rubric_path`. A rubric contains named criteria with descriptions and
+positive weights:
+
+```json
+{
+  "name": "answer_quality",
+  "aggregation": "weighted_mean",
+  "criteria": [
+    {"name": "correctness", "description": "Matches the expected result", "weight": 2},
+    {"name": "clarity", "description": "Is concise and understandable", "weight": 1}
+  ]
+}
+```
+
+The supported aggregation modes are `weighted_mean`, `mean`, and `minimum`.
+The rubric must contain 1–32 unique criteria, each with a non-empty name and
+description. Criterion names and descriptions are limited to 2,000 characters;
+the complete rubric is limited to 16 KiB.
+
+For every step, the judge must return exactly one score in `[0, 1]` for every
+criterion:
+
+```json
+{"scores": {"correctness": 0.9, "clarity": 0.8}}
+```
+
+The adapter validates every score and computes the aggregate locally. Missing,
+extra, malformed, non-finite, or out-of-range criterion scores fail the job
+closed. The rubric and trajectory are sent as structured JSON data, and the
+judge is explicitly instructed to treat them as data rather than executable
+instructions.
+
+### Benchmark/reference scoring
+
+Set `scoring_mode` to `reference` and provide `reference_registry_path` and a
+`reference_rubric`. The registry is adapter-local, so it can be mounted with
+benchmark data or baked into the adapter image without a server change. Its
+minimum shape is:
+
+```json
+{
+  "version": 1,
+  "rubrics": {
+    "answer_quality": {
+      "criteria": [
+        {"name": "correctness", "description": "Matches the expected result", "weight": 1.0}
+      ],
+      "references": {
+        "trajectory-id": {"answer": "Expected answer"},
+        "default": {"answer": "Fallback reference"}
+      }
+    }
+  }
+}
+```
+
+Criteria names must be unique, and weights must be finite positive numbers.
+Each rubric must contain at least one criterion and one reference fixture. The
+adapter selects a fixture using `extra.reference_id`, then `trajectory_id`,
+then the optional `default` fixture. Missing fixtures fail the job rather than
+silently falling back to auto scoring. The selected rubric and reference are
+included in each judge request; score validation, failure categorization,
+training eligibility, and aggregate metrics remain the same as auto scoring.
 
 ### Criteria derivation
 
@@ -118,8 +195,10 @@ protocol failure.
 
 ### Failure categorization
 
-When a step score is below `failure_threshold`, the adapter makes a second
-judge request for a category. Supported categories are:
+When a step receives a valid score below `failure_threshold`, it is a
+detectable agent-behavior failure and the adapter makes a second judge request
+for a category. A score at or above the threshold is not sent for
+categorization. Supported categories are:
 
 - `tool_selection_failure`
 - `context_loss`
@@ -127,23 +206,43 @@ judge request for a category. Supported categories are:
 - `reasoning_failure`
 - `none`
 
-Invalid categorization responses are retained as `uncategorized` with the raw
-response in the step metadata. Categorization rate
+Each categorized step includes `category`, a `[0, 1]` `confidence`, a
+`rationale`, and `categorization_status: categorized`. Invalid or incomplete
+categorization responses are retained as `uncategorized` with the raw response
+in the step metadata and `categorization_status: uncategorized`. If the
+categorization judge is unavailable after retries, the step is retained as
+`uncategorized` with `categorization_status: judge_error`; transport details
+are logged but are not copied into result metadata. Categorization rate
 is calculated over trajectories containing detectable failures: a trajectory
 counts as fully categorized only when all of its detectable failures receive a
-category other than `uncategorized`.
+valid category response, including `none` when the judge finds no actionable
+failure.
 
-The adapter currently scores top-level steps only. It validates nested
-subagent step limits but does not recursively score or aggregate nested
-subagent trajectories.
+### Nested subagent scoring
+
+Embedded `subagent_trajectories` are scored recursively and retained under
+their parent in `evaluation_metadata["atif_trajectories"]`. Each trajectory has
+its own `score`; parents also expose `aggregate_score`. Nested trajectory IDs
+must be unique across the complete input collection. The depth and total-step
+limits prevent unbounded work, and cyclic in-memory structures are rejected by
+the scoring helper.
+
+The default `flat` mode includes root and nested scores in the overall mean.
+`hierarchical` rolls each child aggregate into its parent before calculating
+the root-level mean. `separate` keeps nested scores available as diagnostics
+but calculates the overall score from roots only. Failure and categorization
+diagnostics include all scored trajectories.
 
 ### Retries and errors
 
 HTTP 429 responses are retried up to three attempts with exponential backoff.
 Other HTTP errors, request failures, invalid score responses, and input
-validation errors fail the job. A malformed judge response is therefore
-visible as an evaluation failure instead of producing a misleading successful
-zero score.
+validation errors during scoring fail the job. A malformed score response is
+therefore visible as an evaluation failure instead of producing a misleading
+successful zero score. A transport failure during the separate categorization
+request is isolated to that step and reported as `judge_error`, so the score
+result remains usable while its categorization rate reflects the missing
+category.
 
 ## Results
 
@@ -168,6 +267,8 @@ atif_scoring_mode
 atif_failure_threshold
 atif_detectable_failure_count
 atif_categorized_failure_count
+atif_uncategorized_failure_count
+atif_categorization_judge_error_count
 atif_detectable_failure_trajectory_count
 atif_categorized_failure_trajectory_count
 atif_failure_categorization_rate
@@ -177,9 +278,11 @@ atif_training_manifest
 
 Each entry in `atif_trajectories` contains the trajectory ID, local source
 path, aggregate score, step count, per-step results, detectable-failure count,
-categorized-failure count, and `training_eligible`. Each step result contains
-its step ID and score; categorized failures also contain category, confidence,
-and rationale.
+categorized-failure count, uncategorized-failure count,
+categorization-judge-error count, and `training_eligible`. Each step result
+contains its step ID and score. Detectable failures additionally contain
+`category`, `confidence`, `rationale`, and `categorization_status`; malformed
+responses also contain `raw_judge_response`.
 
 When `training_threshold` is set, `atif_training_manifest` contains the local
 source paths of trajectories whose aggregate score meets the threshold. These
@@ -215,16 +318,17 @@ PYTHONPATH=. pytest -q tests
 The test suite covers ATIF parsing and limits, supported schema versions,
 duplicate IDs, malformed input, score validation, genuine zero scores,
 failure categorization, 429 retries, training eligibility, and invalid
-training thresholds.
+training thresholds. Reference-mode tests cover rubric selection, reference
+injection into judge prompts, and missing-fixture failures.
 
 ## Current limitations
 
 - Input is local or mounted filesystem data; S3 discovery and download are
   owned by a downstream EvalHub input contract.
-- Only the `auto` scoring flow is implemented.
-- Benchmark/reference scoring and custom rubric configuration are not
-  implemented.
-- Nested `subagent_trajectories` are validated for limits but not scored.
+- The reference flow currently uses file-backed registries; server-managed
+  benchmark catalogs are not implemented.
+- Nested `subagent_trajectories` are scored recursively with configurable depth,
+  total-step, duplicate-ID, and aggregation controls.
 - Partial-result and resume/checkpoint policies are not implemented.
 - Per-step judge diagnostics are limited; full structured redacted diagnostics
   and typed result fields require additional work.

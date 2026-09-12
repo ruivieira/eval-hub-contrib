@@ -33,6 +33,23 @@ benchmarks:
       threshold: 0.5
 
 parameters:
+  - name: scoring_mode
+    type: string
+    default: auto
+    description: Scoring mode; auto uses judge-derived criteria, reference uses a local registry, and custom uses an inline or mounted rubric.
+  - name: reference_registry_path
+    type: string
+    description: Path to a JSON rubric registry required when scoring_mode is reference.
+  - name: reference_rubric
+    type: string
+    default: default
+    description: Rubric name selected from the reference registry.
+  - name: custom_rubric
+    type: object
+    description: Inline custom scoring rubric used when scoring_mode is custom.
+  - name: custom_rubric_path
+    type: string
+    description: Mounted JSON custom scoring rubric path used when scoring_mode is custom.
   - name: concurrency_limit
     type: integer
     default: 10
