@@ -83,12 +83,13 @@ Parameters are supplied through the EvalHub job's generic `parameters` object.
 | Parameter | Type | Default | Description |
 | --- | --- | ---: | --- |
 | `trajectory_path` | string | `/test_data/trajectory.json` | Single ATIF JSON file or directory containing ATIF JSON files. |
-| `scoring_mode` | string | `auto` | `auto` derives criteria; `benchmark` uses a built-in benchmark rubric; `reference` uses a local registry; `custom` uses `custom_rubric` or `custom_rubric_path`. |
+| `scoring_mode` | string | `auto` | `auto` derives criteria; `benchmark` uses a built-in benchmark rubric; `reference` uses a local registry; `custom` uses `provider_params.rubric`. |
 | `benchmark_name` | string | unset | Built-in benchmark name required by `benchmark` mode. |
 | `reference_registry_path` | string | unset | JSON registry path required for `reference` mode. |
 | `reference_rubric` | string | `default` | Named rubric selected from the registry. |
-| `custom_rubric` | object/string | unset | Inline rubric object or JSON string required for `custom` mode. Mutually exclusive with `custom_rubric_path`. |
-| `custom_rubric_path` | string | unset | Mounted JSON rubric path required for `custom` mode. Maximum size is 16 KiB. |
+| `provider_params.rubric` | object/string | unset | Canonical inline rubric object or YAML/JSON document required for `custom` mode. Maximum size is 16 KiB for document strings. |
+| `custom_rubric` | object/string | unset | Backward-compatible alias for `provider_params.rubric`. |
+| `custom_rubric_path` | string | unset | Backward-compatible mounted YAML or JSON rubric path. Maximum size is 16 KiB. |
 | `concurrency_limit` | integer | `10` | Maximum number of top-level trajectories scored concurrently. Values below 1 are clamped to one for scoring. |
 | `max_file_bytes` | integer | `10485760` | Maximum size of an individual input file in bytes. Must be positive. |
 | `max_trajectory_files` | integer | `10000` | Maximum number of discovered JSON files. Must be positive. |
@@ -128,8 +129,8 @@ each trajectory and the training manifest is empty.
 
 ### Custom scoring
 
-Set `scoring_mode` to `custom` and provide either `custom_rubric` or
-`custom_rubric_path`. A rubric contains named criteria with descriptions and
+Set `scoring_mode` to `custom` and provide `provider_params.rubric`. The rubric
+may be an object or a YAML/JSON document string. A rubric contains named criteria with descriptions and
 positive weights:
 
 ```json
@@ -142,6 +143,24 @@ positive weights:
   ]
 }
 ```
+
+For example, the same rubric can be supplied as YAML:
+
+```yaml
+name: answer_quality
+aggregation: weighted_mean
+criteria:
+  - name: correctness
+    description: Matches the expected result
+    weight: 2
+  - name: clarity
+    description: Is concise and understandable
+    weight: 1
+```
+
+The older `custom_rubric` and `custom_rubric_path` parameters remain accepted.
+Only one rubric source may be supplied. Rubrics are parsed and fully validated
+when the job starts, before trajectory loading or judge calls.
 
 The supported aggregation modes are `weighted_mean`, `mean`, and `minimum`.
 The rubric must contain 1–32 unique criteria, each with a non-empty name and

@@ -49,10 +49,13 @@ parameters:
     description: Rubric name selected from the reference registry.
   - name: custom_rubric
     type: object
-    description: Inline custom scoring rubric used when scoring_mode is custom.
+    description: Legacy inline custom scoring rubric; prefer provider_params.rubric when scoring_mode is custom.
   - name: custom_rubric_path
     type: string
-    description: Mounted JSON custom scoring rubric path used when scoring_mode is custom.
+    description: Legacy mounted YAML or JSON custom scoring rubric path; prefer provider_params.rubric when scoring_mode is custom.
+  - name: provider_params
+    type: object
+    description: Provider-specific parameters. For custom scoring, rubric accepts an inline object or YAML/JSON document string.
   - name: concurrency_limit
     type: integer
     default: 10

@@ -14,6 +14,7 @@ from typing import Any, get_args
 import httpx
 from opentelemetry import metrics as otel_metrics
 from pydantic import ValidationError
+import yaml
 from evalhub.adapter import (
     DefaultCallbacks,
     EvaluationResult,
@@ -751,15 +752,33 @@ class ATIFAdapter(FrameworkAdapter):
         """Load and normalize a rubric supplied through generic job parameters.
 
         The rubric is treated as data and inserted into the JSON judge payload;
-        it is never concatenated into an executable prompt. A path is accepted
-        for mounted jobs, while an object or JSON string supports API callers.
+        it is never concatenated into an executable prompt. The canonical
+        interface is ``provider_params.rubric``; the older custom rubric
+        parameters remain supported for compatibility.
         """
+        provider_params = params.get("provider_params")
+        if provider_params is not None and not isinstance(provider_params, dict):
+            raise CustomRubricError("provider_params must be an object")
+
+        provider_rubric = (
+            provider_params.get("rubric") if isinstance(provider_params, dict) else None
+        )
         configured = params.get("custom_rubric")
         rubric_path = params.get("custom_rubric_path")
-        if configured is not None and rubric_path is not None:
+        configured_sources = sum(
+            value is not None
+            for value in (provider_rubric, configured, rubric_path)
+        )
+        if configured_sources > 1:
             raise CustomRubricError(
-                "provide only one of custom_rubric or custom_rubric_path"
+                "provide only one rubric through provider_params.rubric, "
+                "custom_rubric, or custom_rubric_path"
             )
+        configured = (
+            provider_rubric
+            if provider_rubric is not None
+            else configured
+        )
         if rubric_path is not None:
             try:
                 raw = Path(str(rubric_path)).read_text(encoding="utf-8")
@@ -771,23 +790,18 @@ class ATIFAdapter(FrameworkAdapter):
                 raise CustomRubricError(
                     f"custom rubric exceeds {MAX_CUSTOM_RUBRIC_BYTES} bytes"
                 )
-            try:
-                configured = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise CustomRubricError("custom rubric is not valid JSON") from exc
+            configured = cls._parse_custom_rubric_document(raw)
         elif isinstance(configured, str):
             if len(configured.encode("utf-8")) > MAX_CUSTOM_RUBRIC_BYTES:
                 raise CustomRubricError(
                     f"custom rubric exceeds {MAX_CUSTOM_RUBRIC_BYTES} bytes"
                 )
-            try:
-                configured = json.loads(configured)
-            except json.JSONDecodeError as exc:
-                raise CustomRubricError("custom_rubric string is not valid JSON") from exc
+            configured = cls._parse_custom_rubric_document(configured)
 
         if not isinstance(configured, dict):
             raise CustomRubricError(
-                "custom scoring requires a custom_rubric object, JSON string, or custom_rubric_path"
+                "custom scoring requires a rubric object or YAML/JSON document "
+                "through provider_params.rubric, custom_rubric, or custom_rubric_path"
             )
         criteria = configured.get("criteria")
         if not isinstance(criteria, list) or not criteria:
@@ -844,6 +858,16 @@ class ATIFAdapter(FrameworkAdapter):
             "criteria": normalized,
             "aggregation": aggregation,
         }
+
+    @staticmethod
+    def _parse_custom_rubric_document(raw: str) -> Any:
+        """Parse one YAML/JSON rubric document without constructing Python objects."""
+        try:
+            return yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            raise CustomRubricError(
+                "custom rubric is not valid YAML or JSON"
+            ) from exc
 
     async def _score_trajectories(
         self,
