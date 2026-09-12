@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import respx
 from evalhub.adapter import JobCallbacks
 from httpx import Response
 
-from main import ATIFAdapter
+from main import ATIFAdapter, ATIFLoadError
 
 
 JOB_SPEC_PATH = Path(__file__).resolve().parent.parent / "meta" / "job.json"
@@ -53,6 +54,85 @@ def test_discover_directory(tmp_path: Path):
 
     files = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)._discover_atif_files(str(tmp_path))
     assert len(files) == 2
+
+
+def _valid_trajectory() -> dict:
+    return json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "trajectory.json").read_text()
+    )
+
+
+def _write_json(path: Path, value: object) -> Path:
+    path.write_text(json.dumps(value))
+    return path
+
+
+def test_load_valid_trajectory_uses_sdk_model(tmp_path: Path):
+    trajectory_file = _write_json(tmp_path / "valid.json", _valid_trajectory())
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    loaded = adapter._load_trajectories([trajectory_file])
+
+    assert len(loaded) == 1
+    assert loaded[0]["schema_version"] == "ATIF-v1.8"
+    assert loaded[0]["trajectory_id"] == "t1"
+
+
+def test_load_rejects_malformed_json(tmp_path: Path):
+    trajectory_file = tmp_path / "malformed.json"
+    trajectory_file.write_text("{not-json")
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    with pytest.raises(ATIFLoadError, match="invalid ATIF trajectory"):
+        adapter._load_trajectories([trajectory_file])
+
+
+def test_load_rejects_invalid_trajectory_using_sdk_validation(tmp_path: Path):
+    trajectory = _valid_trajectory()
+    trajectory["steps"][1]["step_id"] = 3
+    trajectory_file = _write_json(tmp_path / "invalid-step.json", trajectory)
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    with pytest.raises(ATIFLoadError, match="expected 2"):
+        adapter._load_trajectories([trajectory_file])
+
+
+def test_load_rejects_unsupported_schema_version(tmp_path: Path):
+    trajectory = _valid_trajectory()
+    trajectory["schema_version"] = "ATIF-v9.9"
+    trajectory_file = _write_json(tmp_path / "unsupported-version.json", trajectory)
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    with pytest.raises(ATIFLoadError, match="unsupported schema_version"):
+        adapter._load_trajectories([trajectory_file])
+
+
+def test_load_rejects_empty_collection(tmp_path: Path):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    with pytest.raises(ATIFLoadError, match="No ATIF JSON"):
+        adapter._load_trajectories([])
+
+
+def test_load_rejects_duplicate_trajectory_ids(tmp_path: Path):
+    trajectory = _valid_trajectory()
+    first = _write_json(tmp_path / "first.json", trajectory)
+    second = _write_json(tmp_path / "second.json", trajectory)
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    with pytest.raises(ATIFLoadError, match="duplicate trajectory_id"):
+        adapter._load_trajectories([first, second])
+
+
+def test_load_rejects_file_and_step_limits(tmp_path: Path):
+    trajectory_file = _write_json(tmp_path / "valid.json", _valid_trajectory())
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+
+    with pytest.raises(ATIFLoadError, match="exceeds maximum"):
+        adapter._load_trajectories([trajectory_file], max_file_bytes=1)
+
+    with pytest.raises(ATIFLoadError, match="maximum is 1"):
+        adapter._load_trajectories([trajectory_file], max_steps_per_trajectory=1)
 
 
 def test_judge_429_retry(job_spec):

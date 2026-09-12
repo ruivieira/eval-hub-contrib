@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from pydantic import ValidationError
 from evalhub.adapter import (
     DefaultCallbacks,
     EvaluationResult,
@@ -29,6 +30,15 @@ from evalhub.models.atif import Trajectory
 logger = logging.getLogger(__name__)
 
 
+MAX_ATIF_FILE_BYTES = 10 * 1024 * 1024
+MAX_ATIF_FILES = 10_000
+MAX_STEPS_PER_TRAJECTORY = 500
+
+
+class ATIFLoadError(ValueError):
+    """Raised when an ATIF input collection cannot be loaded safely."""
+
+
 class ATIFAdapter(FrameworkAdapter):
     def run_benchmark_job(self, config: JobSpec, callbacks: JobCallbacks) -> JobResults:
         start_time = time.monotonic()
@@ -45,6 +55,11 @@ class ATIFAdapter(FrameworkAdapter):
         params = config.parameters or {}
         concurrency_limit = int(params.get("concurrency_limit", 10))
         trajectory_path = params.get("trajectory_path", "/test_data/trajectory.json")
+        max_file_bytes = int(params.get("max_file_bytes", MAX_ATIF_FILE_BYTES))
+        max_files = int(params.get("max_trajectory_files", MAX_ATIF_FILES))
+        max_steps = int(
+            params.get("max_steps_per_trajectory", MAX_STEPS_PER_TRAJECTORY)
+        )
 
         callbacks.report_status(
             JobStatusUpdate(
@@ -68,7 +83,12 @@ class ATIFAdapter(FrameworkAdapter):
             )
         )
 
-        trajectories = self._load_trajectories(atif_files)
+        trajectories = self._load_trajectories(
+            atif_files,
+            max_file_bytes=max_file_bytes,
+            max_files=max_files,
+            max_steps_per_trajectory=max_steps,
+        )
         scored = asyncio.run(self._score_trajectories(trajectories, concurrency_limit))
 
         avg_score = sum(item["score"] for item in scored) / len(scored) if scored else 0.0
@@ -113,16 +133,104 @@ class ATIFAdapter(FrameworkAdapter):
     def _discover_atif_files(self, uri: str) -> list[Path]:
         path = Path(uri)
         if not path.exists():
-            raise FileNotFoundError(f"ATIF path does not exist: {uri}")
+            raise ATIFLoadError(f"ATIF path does not exist: {uri}")
         if path.is_file():
+            if path.suffix.lower() != ".json":
+                raise ATIFLoadError(f"ATIF input must be a JSON file: {path}")
             return [path]
-        return sorted([p for p in path.rglob("*.json") if p.is_file()])
 
-    def _load_trajectories(self, files: list[Path]) -> list[dict[str, Any]]:
+        if not path.is_dir():
+            raise ATIFLoadError(f"ATIF input is neither a file nor directory: {path}")
+        return sorted(
+            [p for p in path.rglob("*.json") if p.is_file()],
+            key=lambda item: item.as_posix(),
+        )
+
+    @staticmethod
+    def _supported_schema_versions() -> frozenset[str]:
+        """Read supported versions from the SDK model instead of duplicating them."""
+        schema = Trajectory.model_json_schema()
+        versions = schema["properties"]["schema_version"].get("enum", [])
+        return frozenset(str(version) for version in versions)
+
+    @classmethod
+    def _validate_trajectory_limits(
+        cls, trajectory: Trajectory, source: Path, max_steps_per_trajectory: int
+    ) -> None:
+        if max_steps_per_trajectory < 1:
+            raise ATIFLoadError("max_steps_per_trajectory must be positive")
+
+        def validate(current: Trajectory, location: str) -> None:
+            if len(current.steps) > max_steps_per_trajectory:
+                raise ATIFLoadError(
+                    f"{source}: {location} contains {len(current.steps)} steps; "
+                    f"maximum is {max_steps_per_trajectory}"
+                )
+            for index, subagent in enumerate(current.subagent_trajectories or []):
+                validate(subagent, f"{location}.subagent_trajectories[{index}]")
+
+        validate(trajectory, "trajectory")
+
+    def _load_trajectories(
+        self,
+        files: list[Path],
+        *,
+        max_file_bytes: int = MAX_ATIF_FILE_BYTES,
+        max_files: int = MAX_ATIF_FILES,
+        max_steps_per_trajectory: int = MAX_STEPS_PER_TRAJECTORY,
+    ) -> list[dict[str, Any]]:
+        if max_file_bytes < 1:
+            raise ATIFLoadError("max_file_bytes must be positive")
+        if max_files < 1:
+            raise ATIFLoadError("max_trajectory_files must be positive")
+        if not files:
+            raise ATIFLoadError("No ATIF JSON trajectory files were found")
+        if len(files) > max_files:
+            raise ATIFLoadError(
+                f"ATIF input contains {len(files)} files; maximum is {max_files}"
+            )
+
         trajectories: list[dict[str, Any]] = []
+        trajectory_sources: dict[str, Path] = {}
+        supported_versions = self._supported_schema_versions()
         for file in files:
-            data = json.loads(file.read_text())
-            parsed = Trajectory.model_validate(data)
+            try:
+                file_size = file.stat().st_size
+                if file_size > max_file_bytes:
+                    raise ATIFLoadError(
+                        f"{file}: size {file_size} bytes exceeds maximum "
+                        f"of {max_file_bytes} bytes"
+                    )
+                data = json.loads(file.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ATIFLoadError("top-level JSON value must be an object")
+                schema_version = data.get("schema_version", "ATIF-v1.8")
+                if (
+                    not isinstance(schema_version, str)
+                    or schema_version not in supported_versions
+                ):
+                    supported = ", ".join(sorted(supported_versions))
+                    raise ATIFLoadError(
+                        f"unsupported schema_version {schema_version!r}; "
+                        f"supported versions: {supported}"
+                    )
+                parsed = Trajectory.model_validate(data)
+                self._validate_trajectory_limits(
+                    parsed, file, max_steps_per_trajectory
+                )
+            except ATIFLoadError:
+                raise
+            except (OSError, UnicodeError, json.JSONDecodeError, ValidationError) as exc:
+                raise ATIFLoadError(f"invalid ATIF trajectory {file}: {exc}") from exc
+
+            if parsed.trajectory_id is not None:
+                previous = trajectory_sources.get(parsed.trajectory_id)
+                if previous is not None:
+                    raise ATIFLoadError(
+                        f"duplicate trajectory_id {parsed.trajectory_id!r} in "
+                        f"{file}; already defined in {previous}"
+                    )
+                trajectory_sources[parsed.trajectory_id] = file
             trajectories.append(parsed.model_dump(mode="json"))
         return trajectories
 
