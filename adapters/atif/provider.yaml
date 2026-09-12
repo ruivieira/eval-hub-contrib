@@ -22,6 +22,7 @@ benchmarks:
     category: agentic
     metrics:
       - atif_overall_score
+      - atif_failure_categorization_rate
     tags:
       - atif
       - trajectory
@@ -48,3 +49,7 @@ parameters:
     type: integer
     default: 500
     description: Maximum number of steps allowed in each trajectory, including nested subagents
+  - name: failure_threshold
+    type: float
+    default: 0.5
+    description: Scores below this threshold trigger failure categorization

@@ -45,6 +45,60 @@ def test_atif_adapter_happy_path(job_spec):
     assert "atif_trajectories" in result.evaluation_metadata
 
 
+def test_failure_categorization_for_low_scoring_step(job_spec):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=json.dumps({"score": 0.2})),
+                Response(
+                    200,
+                    text=json.dumps(
+                        {
+                            "category": "reasoning_failure",
+                            "confidence": 0.9,
+                            "rationale": "The action contradicts the preceding observation.",
+                        }
+                    ),
+                ),
+                Response(200, text=json.dumps({"score": 0.8})),
+            ]
+        )
+
+        result = adapter.run_benchmark_job(job_spec, callbacks)
+
+    trajectory = result.evaluation_metadata["atif_trajectories"][0]
+    assert trajectory["detectable_failure_count"] == 1
+    assert trajectory["categorized_failure_count"] == 1
+    assert trajectory["steps"][0]["category"] == "reasoning_failure"
+    assert result.evaluation_metadata["atif_failure_categorization_rate"] == 1.0
+
+
+def test_invalid_failure_category_is_uncategorized_with_raw_response(job_spec):
+    adapter = ATIFAdapter(job_spec_path=JOB_SPEC_PATH)
+    callbacks = FakeCallbacks()
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.post("http://localhost:8080/v1/chat/completions").mock(
+            side_effect=[
+                Response(200, text=json.dumps({"criteria": [{"name": "quality"}]})),
+                Response(200, text=json.dumps({"score": 0.2})),
+                Response(200, text="not valid category JSON"),
+                Response(200, text=json.dumps({"score": 0.8})),
+            ]
+        )
+
+        result = adapter.run_benchmark_job(job_spec, callbacks)
+
+    step = result.evaluation_metadata["atif_trajectories"][0]["steps"][0]
+    assert step["category"] == "uncategorized"
+    assert step["raw_judge_response"] == "not valid category JSON"
+    assert result.evaluation_metadata["atif_failure_categorization_rate"] == 0.0
+
+
 def test_discover_directory(tmp_path: Path):
     f1 = tmp_path / "a.json"
     f2 = tmp_path / "nested" / "b.json"

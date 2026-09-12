@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 MAX_ATIF_FILE_BYTES = 10 * 1024 * 1024
 MAX_ATIF_FILES = 10_000
 MAX_STEPS_PER_TRAJECTORY = 500
+DEFAULT_FAILURE_THRESHOLD = 0.5
+FAILURE_CATEGORIES = frozenset(
+    {
+        "tool_selection_failure",
+        "context_loss",
+        "policy_boundary_violation",
+        "reasoning_failure",
+        "none",
+    }
+)
 
 
 class ATIFLoadError(ValueError):
@@ -60,6 +70,11 @@ class ATIFAdapter(FrameworkAdapter):
         max_steps = int(
             params.get("max_steps_per_trajectory", MAX_STEPS_PER_TRAJECTORY)
         )
+        failure_threshold = float(
+            params.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD)
+        )
+        if not 0.0 <= failure_threshold <= 1.0:
+            raise ValueError("failure_threshold must be between 0 and 1")
 
         callbacks.report_status(
             JobStatusUpdate(
@@ -89,9 +104,29 @@ class ATIFAdapter(FrameworkAdapter):
             max_files=max_files,
             max_steps_per_trajectory=max_steps,
         )
-        scored = asyncio.run(self._score_trajectories(trajectories, concurrency_limit))
+        scored = asyncio.run(
+            self._score_trajectories(
+                trajectories, concurrency_limit, failure_threshold=failure_threshold
+            )
+        )
 
         avg_score = sum(item["score"] for item in scored) / len(scored) if scored else 0.0
+        detectable_failures = sum(item["detectable_failure_count"] for item in scored)
+        categorized_failures = sum(item["categorized_failure_count"] for item in scored)
+        detectable_failure_trajectories = sum(
+            item["detectable_failure_count"] > 0 for item in scored
+        )
+        categorized_failure_trajectories = sum(
+            item["detectable_failure_count"] > 0
+            and item["categorized_failure_count"]
+            == item["detectable_failure_count"]
+            for item in scored
+        )
+        categorization_rate = (
+            categorized_failure_trajectories / detectable_failure_trajectories
+            if detectable_failure_trajectories
+            else 1.0
+        )
 
         callbacks.report_status(
             JobStatusUpdate(
@@ -119,6 +154,11 @@ class ATIFAdapter(FrameworkAdapter):
                     metric_value=float(len(scored)),
                     metric_type="float",
                 ),
+                EvaluationResult(
+                    metric_name="atif_failure_categorization_rate",
+                    metric_value=categorization_rate,
+                    metric_type="float",
+                ),
             ],
             overall_score=avg_score,
             num_examples_evaluated=len(scored),
@@ -127,6 +167,12 @@ class ATIFAdapter(FrameworkAdapter):
             evaluation_metadata={
                 "atif_trajectories": scored,
                 "atif_scoring_mode": "auto",
+                "atif_failure_threshold": failure_threshold,
+                "atif_detectable_failure_count": detectable_failures,
+                "atif_categorized_failure_count": categorized_failures,
+                "atif_detectable_failure_trajectory_count": detectable_failure_trajectories,
+                "atif_categorized_failure_trajectory_count": categorized_failure_trajectories,
+                "atif_failure_categorization_rate": categorization_rate,
             },
         )
 
@@ -234,7 +280,13 @@ class ATIFAdapter(FrameworkAdapter):
             trajectories.append(parsed.model_dump(mode="json"))
         return trajectories
 
-    async def _score_trajectories(self, trajectories: list[dict[str, Any]], concurrency_limit: int) -> list[dict[str, Any]]:
+    async def _score_trajectories(
+        self,
+        trajectories: list[dict[str, Any]],
+        concurrency_limit: int,
+        *,
+        failure_threshold: float = DEFAULT_FAILURE_THRESHOLD,
+    ) -> list[dict[str, Any]]:
         criteria = await self._derive_criteria(trajectories[0]) if trajectories else {"criteria": []}
         semaphore = asyncio.Semaphore(max(1, concurrency_limit))
 
@@ -244,7 +296,9 @@ class ATIFAdapter(FrameworkAdapter):
         async def score_one(index: int, trajectory: dict[str, Any]) -> dict[str, Any]:
             nonlocal first_done
             async with semaphore:
-                score = await self._score_single_trajectory(trajectory, criteria)
+                details = await self._score_single_trajectory_details(
+                    trajectory, criteria, failure_threshold
+                )
                 if not first_done:
                     first_done = True
                     elapsed = time.monotonic() - start
@@ -252,7 +306,7 @@ class ATIFAdapter(FrameworkAdapter):
                     logger.info("Estimated remaining time: %.2fs", remaining)
                 return {
                     "trajectory_id": trajectory.get("trajectory_id", f"trajectory-{index}"),
-                    "score": score,
+                    **details,
                     "step_count": len(trajectory.get("steps", [])),
                 }
 
@@ -272,7 +326,21 @@ class ATIFAdapter(FrameworkAdapter):
             return {"criteria": [{"name": "default", "weight": 1.0}]}
 
     async def _score_single_trajectory(self, trajectory: dict[str, Any], criteria: dict[str, Any]) -> float:
+        details = await self._score_single_trajectory_details(
+            trajectory, criteria, DEFAULT_FAILURE_THRESHOLD
+        )
+        return details["score"]
+
+    async def _score_single_trajectory_details(
+        self,
+        trajectory: dict[str, Any],
+        criteria: dict[str, Any],
+        failure_threshold: float,
+    ) -> dict[str, Any]:
         step_scores: list[float] = []
+        step_results: list[dict[str, Any]] = []
+        detectable_failure_count = 0
+        categorized_failure_count = 0
         for step in trajectory.get("steps", []):
             payload = {
                 "criteria": criteria,
@@ -282,10 +350,70 @@ class ATIFAdapter(FrameworkAdapter):
             response = await self._judge_call(payload)
             try:
                 parsed = json.loads(response)
-                step_scores.append(float(parsed.get("score", 0.0)))
+                score = float(parsed.get("score", 0.0))
             except (json.JSONDecodeError, TypeError, ValueError):
-                step_scores.append(0.0)
-        return sum(step_scores) / len(step_scores) if step_scores else 0.0
+                score = 0.0
+            step_scores.append(score)
+
+            step_result: dict[str, Any] = {
+                "step_id": step.get("step_id"),
+                "score": score,
+            }
+            if score < failure_threshold:
+                detectable_failure_count += 1
+                category = await self._categorize_failure(
+                    step, score, criteria
+                )
+                step_result.update(category)
+                if category["category"] != "uncategorized":
+                    categorized_failure_count += 1
+            step_results.append(step_result)
+
+        return {
+            "score": sum(step_scores) / len(step_scores) if step_scores else 0.0,
+            "steps": step_results,
+            "detectable_failure_count": detectable_failure_count,
+            "categorized_failure_count": categorized_failure_count,
+        }
+
+    async def _categorize_failure(
+        self, step: dict[str, Any], score: float, criteria: dict[str, Any]
+    ) -> dict[str, Any]:
+        payload = {
+            "criteria": criteria,
+            "step": step,
+            "score": score,
+            "allowed_categories": sorted(FAILURE_CATEGORIES),
+            "request": (
+                "Classify this low-scoring agent step. Return only JSON with "
+                "category, confidence, and rationale. category must be one of "
+                "tool_selection_failure, context_loss, policy_boundary_violation, "
+                "reasoning_failure, or none. Use none when no actionable "
+                "failure is detectable."
+            ),
+        }
+        raw_response = await self._judge_call(payload)
+        try:
+            parsed = json.loads(raw_response)
+            category = parsed["category"]
+            if category not in FAILURE_CATEGORIES:
+                raise ValueError("unknown failure category")
+            confidence = float(parsed.get("confidence", 0.0))
+            if not 0.0 <= confidence <= 1.0:
+                raise ValueError("confidence must be between 0 and 1")
+            result = {
+                "category": category,
+                "confidence": confidence,
+                "rationale": str(parsed.get("rationale", "")),
+            }
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            result = {
+                "category": "uncategorized",
+                "confidence": 0.0,
+                "rationale": "Judge response did not match the failure taxonomy",
+                "raw_judge_response": raw_response,
+            }
+        return result
 
     async def _judge_call(self, payload: dict[str, Any]) -> str:
         retries = 3
